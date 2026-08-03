@@ -98,7 +98,12 @@ class RigSettings:
 
     #: Contour simplification, as a fraction of the part's perimeter.
     contour_epsilon: float = 0.004
+    #: Absolute cap on that tolerance, in pixels. A pure fraction erases small or
+    #: thin parts -- a ribbon with a 200 px perimeter would get an 8 px tolerance,
+    #: enough to collapse its outline below three points and fail to mesh.
+    contour_epsilon_max_px: float = 4.0
     #: Interior sample spacing in pixels. Lower = denser mesh = smoother bends.
+    #: Scaled down for small parts (see rig._interior_points).
     interior_spacing: int = 28
     #: Max bones influencing one vertex. Spine allows any number; 4 is plenty
     #: and keeps the JSON small.

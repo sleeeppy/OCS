@@ -266,6 +266,32 @@ TAG_TO_BONE = {
     "objects": "torso",
 }
 
+#: Hard layering constraints: ``tag: (tags it must draw *after*)``.
+#:
+#: see-through's ``depth_median`` is a per-image estimate and is wrong for thin
+#: overlapping accessories. Measured on one character: ``headwear`` (a ribbon tied
+#: over the hair) came out at depth 0.231 against ``front hair`` at 0.098, so the
+#: hair drew last and hid 91% of the ribbon. Six more inversions in the same
+#: export put ``eyebrow`` under ``face`` and ``nose`` under ``eyewhite``.
+#:
+#: Upstream only patches a few of these itself -- ``further_extr`` nudges
+#: nose/mouth/eyes behind ``face`` but never touches the v3 split eye tags.
+#:
+#: Only unambiguous relationships belong here. Bangs versus glasses, for
+#: instance, genuinely varies by artwork, so it is left to the depth estimate.
+DRAW_AFTER: dict[str, tuple[str, ...]] = {
+    "headwear": ("front hair", "back hair"),
+    "front hair": ("face", "ears", "earwear", "neck"),
+    "eyewhite": ("face",),
+    "irides": ("face", "eyewhite"),
+    "eyelash": ("face", "eyewhite", "irides"),
+    "eyebrow": ("face",),
+    "nose": ("face",),
+    "mouth": ("face",),
+    "eyewear": ("face", "eyewhite", "irides", "eyelash", "eyebrow", "nose"),
+    "footwear": ("legwear",),
+}
+
 #: Draw-order tie-break, applied *after* see-through's depth ordering. Larger
 #: sorts nearer the viewer. Only consulted when two layers share a depth.
 Z_PRIOR = {

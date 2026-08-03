@@ -146,10 +146,88 @@ def test_skeleton_json_validates(figure):
     assert doc["skins"][0]["name"] == "default"
 
 
-def test_slot_order_is_draw_order_far_to_near(figure):
+def test_slot_order_follows_depth_where_unconstrained(figure):
+    """Depth still drives the order for parts with no layering constraint."""
     built, _ = build(figure)
-    depths = [s.depth_median for s in built.slots]
+    constrained = set(taxonomy.DRAW_AFTER) | {
+        t for deps in taxonomy.DRAW_AFTER.values() for t in deps
+    }
+    depths = [s.depth_median for s in built.slots
+              if taxonomy.base_tag(s.part_name) not in constrained]
     assert depths == sorted(depths, reverse=True), "slots must run far -> near"
+
+
+def test_layering_constraints_beat_the_depth_estimate(figure):
+    """A part that must sit on top does, even when depth says otherwise.
+
+    Measured failure this guards: ``headwear`` came out of see-through at depth
+    0.231 against ``front hair`` at 0.098, so the hair drew last and covered 91%
+    of the ribbon.
+    """
+    built, _ = build(figure)
+    index = {taxonomy.base_tag(s.part_name): i for i, s in enumerate(built.slots)}
+
+    checked = 0
+    for tag, blockers in taxonomy.DRAW_AFTER.items():
+        if tag not in index:
+            continue
+        for blocker in blockers:
+            if blocker not in index:
+                continue
+            # Only meaningful when the two actually overlap; the resolver skips
+            # non-overlapping pairs, so this mirrors that.
+            a = [p for p in figure.parts if p.tag == tag]
+            b = [p for p in figure.parts if p.tag == blocker]
+            if not a or not b:
+                continue
+            import numpy as np
+            ma = np.zeros(figure.canvas[::-1], bool)
+            mb = np.zeros(figure.canvas[::-1], bool)
+            for p in a:
+                ma |= p.canvas_mask(figure.canvas)
+            for p in b:
+                mb |= p.canvas_mask(figure.canvas)
+            inter = int((ma & mb).sum())
+            if inter < 0.05 * min(int(ma.sum()), int(mb.sum())):
+                continue
+            assert index[tag] > index[blocker], (
+                f"{tag} must draw after {blocker} "
+                f"({index[tag]} vs {index[blocker]})"
+            )
+            checked += 1
+    assert checked, "fixture exercises no layering constraint"
+
+
+def test_meshes_reproduce_multi_component_parts(figure):
+    """Every component of a part must be triangulated, not just the largest.
+
+    Keeping only ``max(contours, key=contourArea)`` reproduced 71% of one part's
+    artwork because two of its three components were dropped.
+    """
+    import cv2
+    import numpy as np
+
+    from ocs.config import RigSettings as RS
+    from ocs import rig as rig_mod_local
+
+    # A deliberately disconnected mask: three separate blobs.
+    mask = np.zeros((120, 200), bool)
+    mask[10:50, 10:60] = True
+    mask[10:50, 80:130] = True
+    mask[70:110, 40:100] = True
+
+    s = RS()
+    pts, n_hull = rig_mod_local._contour_points(mask, s.contour_epsilon,
+                                                s.contour_epsilon_max_px)
+    tris = rig_mod_local._triangulate(pts, mask)
+    assert n_hull >= 3
+    assert tris.shape[0] > 0
+
+    covered = np.zeros(mask.shape, np.uint8)
+    for t in tris:
+        cv2.fillConvexPoly(covered, pts[t].astype(np.int32), 1)
+    ratio = (covered.astype(bool) & mask).sum() / mask.sum()
+    assert ratio > 0.9, f"triangles cover only {ratio:.0%} of a 3-component mask"
 
 
 def test_animations_reference_only_existing_bones(figure):

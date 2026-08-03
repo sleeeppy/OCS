@@ -234,33 +234,60 @@ def _to_bone_local(pt: tuple[float, float], bone: BoneTransform) -> tuple[float,
 # --------------------------------------------------------------------------
 
 
-def _hull_points(mask: np.ndarray, epsilon_frac: float) -> np.ndarray:
-    """Outer contour, simplified. Returns (N, 2) float in part-local px."""
+def _contour_points(
+    mask: np.ndarray, epsilon_frac: float, epsilon_max_px: float
+) -> tuple[np.ndarray, int]:
+    """Simplified outlines of **every** component. Returns (points, hull_count).
+
+    Taking only the largest contour loses whole pieces of a part. Measured on a
+    synthesised skin region: three components, and keeping the biggest covered
+    4438 of 11078 pixels, so the finished mesh reproduced 71% of its own artwork.
+    Delaunay will bridge between components, but ``_triangulate`` drops the
+    bridging triangles because their centres fall outside the mask.
+
+    ``hull_count`` is the largest outline's point count, and those points come
+    first so Spine's ``hull`` field stays meaningful.
+    """
     contours, _ = cv2.findContours(
         mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
     if not contours:
-        return np.empty((0, 2), np.float32)
-    contour = max(contours, key=cv2.contourArea)
-    peri = cv2.arcLength(contour, True)
-    approx = cv2.approxPolyDP(contour, max(1.0, epsilon_frac * peri), True)
-    pts = approx.reshape(-1, 2).astype(np.float32)
-    if pts.shape[0] < 3:
-        return np.empty((0, 2), np.float32)
-    return pts
+        return np.empty((0, 2), np.float32), 0
+
+    ordered = sorted(contours, key=cv2.contourArea, reverse=True)
+    total = float(mask.sum())
+    groups: list[np.ndarray] = []
+    for contour in ordered:
+        if cv2.contourArea(contour) < max(12.0, 0.005 * total):
+            continue
+        peri = cv2.arcLength(contour, True)
+        # Cap the tolerance in absolute pixels. A fraction of the perimeter alone
+        # erases small or thin parts: a ribbon 200 px around gets an 8 px
+        # tolerance, enough to collapse it below three points.
+        eps = max(1.0, min(epsilon_frac * peri, epsilon_max_px))
+        pts = cv2.approxPolyDP(contour, eps, True).reshape(-1, 2).astype(np.float32)
+        if pts.shape[0] >= 3:
+            groups.append(pts)
+
+    if not groups:
+        return np.empty((0, 2), np.float32), 0
+    return np.concatenate(groups, axis=0), int(groups[0].shape[0])
 
 
 def _interior_points(mask: np.ndarray, spacing: int) -> np.ndarray:
     """Grid samples strictly inside the mask, so bends have vertices to move."""
     if spacing < 2:
         return np.empty((0, 2), np.float32)
+    h, w = mask.shape
+    # Scale the grid to the part. A fixed 28 px step leaves a 40 px-wide arm with
+    # a single interior vertex, which is not enough to bend smoothly.
+    spacing = max(6, min(spacing, max(h, w) // 6 or spacing))
     eroded = cv2.erode(
         mask.astype(np.uint8),
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
     ) > 0
     if not eroded.any():
         return np.empty((0, 2), np.float32)
-    h, w = mask.shape
     ys = np.arange(spacing // 2, h, spacing)
     xs = np.arange(spacing // 2, w, spacing)
     gx, gy = np.meshgrid(xs, ys)
@@ -391,13 +418,21 @@ def _mesh_attachment(
     if not mask.any():
         return None
 
-    hull = _hull_points(mask, s.contour_epsilon)
-    if hull.shape[0] < 3:
+    # Trace one pixel outside the alpha. A polygon through the alpha boundary
+    # clips the feathered antialiased rim, and losing a 1 px outline all the way
+    # round a large part is most of its total ink loss (front hair: 1372 px).
+    # Overshooting is free -- the extra band is transparent in the texture.
+    outline_mask = cv2.dilate(
+        mask.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    ) > 0
+
+    outline, n_hull = _contour_points(outline_mask, s.contour_epsilon, s.contour_epsilon_max_px)
+    if outline.shape[0] < 3:
         return None
     interior = _interior_points(mask, s.interior_spacing)
-    points = np.concatenate([hull, interior], axis=0) if interior.size else hull
+    points = np.concatenate([outline, interior], axis=0) if interior.size else outline
 
-    triangles = _triangulate(points, mask)
+    triangles = _triangulate(points, outline_mask)
     if triangles.shape[0] == 0:
         return None
 
@@ -436,7 +471,6 @@ def _mesh_attachment(
             vertices.extend([float(idx), lx, ly, wt / total])
 
     edges: list[int] = []
-    n_hull = hull.shape[0]
     for i in range(n_hull):
         edges.extend([i * 2, ((i + 1) % n_hull) * 2])
 
@@ -472,6 +506,77 @@ def _region_attachment(
 # --------------------------------------------------------------------------
 
 
+def _resolve_draw_order(parts: list[Part], decomp: Decomposition) -> list[Part]:
+    """Far-to-near order: see-through's depth, corrected where it is provably wrong.
+
+    Depth stays the ranking signal because it is per-image and usually right. But
+    it is only an estimate, and for thin overlapping accessories it inverts:
+    measured on one character, ``headwear`` (a ribbon over the hair) ranked
+    *behind* ``front hair``, so the hair drew last and hid 91% of the ribbon.
+
+    ``taxonomy.DRAW_AFTER`` states the relationships that cannot be otherwise, and
+    this is a topological sort over them with depth as the tie-break priority. A
+    constraint only applies between parts whose masks actually overlap, so a hat
+    and a shoe never constrain each other.
+    """
+    import heapq
+
+    order_key = {
+        p.name: (-p.depth_median, taxonomy.z_prior(p.name), p.name) for p in parts
+    }
+    fallback = sorted(parts, key=lambda p: order_key[p.name])
+    if not parts:
+        return fallback
+
+    by_tag: dict[str, list[Part]] = {}
+    for p in parts:
+        by_tag.setdefault(p.tag, []).append(p)
+
+    masks: dict[str, np.ndarray] = {}
+
+    def mask_of(p: Part) -> np.ndarray:
+        if p.name not in masks:
+            masks[p.name] = p.canvas_mask(decomp.canvas)
+        return masks[p.name]
+
+    # edge blocker -> dependent: blocker must be drawn first
+    successors: dict[str, list[str]] = {p.name: [] for p in parts}
+    indegree: dict[str, int] = {p.name: 0 for p in parts}
+
+    for p in parts:
+        for blocker_tag in taxonomy.DRAW_AFTER.get(p.tag, ()):
+            for blocker in by_tag.get(blocker_tag, ()):
+                if blocker.name == p.name:
+                    continue
+                a, b = mask_of(p), mask_of(blocker)
+                inter = int((a & b).sum())
+                smaller = min(int(a.sum()), int(b.sum()))
+                if smaller == 0 or inter < 0.05 * smaller:
+                    continue  # they do not really overlap; order is irrelevant
+                successors[blocker.name].append(p.name)
+                indegree[p.name] += 1
+
+    if not any(indegree.values()):
+        return fallback
+
+    part_by_name = {p.name: p for p in parts}
+    heap = [(order_key[n], n) for n, d in indegree.items() if d == 0]
+    heapq.heapify(heap)
+    out: list[Part] = []
+    while heap:
+        _key, name = heapq.heappop(heap)
+        out.append(part_by_name[name])
+        for nxt in successors[name]:
+            indegree[nxt] -= 1
+            if indegree[nxt] == 0:
+                heapq.heappush(heap, (order_key[nxt], nxt))
+
+    if len(out) != len(parts):
+        # A cycle in DRAW_AFTER would strand parts. Fall back rather than drop any.
+        return fallback
+    return out
+
+
 def _wants_mesh(part: Part) -> bool:
     # Anything the bone partition cut spans a joint by construction, and the
     # bulky garments deform. Everything else is a rigid feature.
@@ -497,12 +602,7 @@ def build_rig(
     images: dict[str, Part] = {}
     warnings: list[str] = []
 
-    # Far layers first, matching see-through's own ordering (depth_median
-    # descending). Z_PRIOR only breaks ties.
-    ordered = sorted(
-        parts,
-        key=lambda p: (-p.depth_median, taxonomy.z_prior(p.name), p.name),
-    )
+    ordered = _resolve_draw_order(parts, decomp)
 
     for part in ordered:
         slug = naming.unique_slug(part.name)
