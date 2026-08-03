@@ -118,6 +118,19 @@ class RigSettings:
     #: A partition slice smaller than this fraction of the source layer is
     #: discarded rather than emitted as a sliver attachment.
     min_slice_fraction: float = 0.02
+    #: Repaint each part's *visible* pixels from the original artwork.
+    #:
+    #: see-through regenerates every layer with a diffusion model rather than
+    #: cropping it, so the returned RGB drifts from the source: measured over one
+    #: character, 11.8% of shared opaque pixels differ by more than 16 levels
+    #: (mean 8.96), which reads as flattened hair shading and a smudged ribbon.
+    #: Where a part is frontmost, the original already holds its exact pixels.
+    #: Upstream does this itself for nose and mouth in ``further_extr``.
+    restore_source_pixels: bool = True
+    #: Only repaint pixels this opaque. Partly transparent edge pixels in the
+    #: source are a blend with whatever is behind, so copying them there would
+    #: pull the neighbour's colour into the seam.
+    source_pixel_alpha_floor: int = 200
 
 
 @dataclass

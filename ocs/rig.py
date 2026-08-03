@@ -577,6 +577,67 @@ def _resolve_draw_order(parts: list[Part], decomp: Decomposition) -> list[Part]:
     return out
 
 
+def restore_source_pixels(
+    ordered: list[Part], decomp: Decomposition, s: RigSettings
+) -> list[Part]:
+    """Repaint each part's visible pixels from the original artwork.
+
+    see-through does not crop layers out of the input, it regenerates each one with
+    a diffusion model, so the RGB it returns drifts from the source. Measured over
+    one character: 11.8% of shared opaque pixels differ by more than 16 levels
+    (mean 8.96), against 1.7% / 2.67% contributed by everything OCS does
+    afterwards. That drift is what flattens hair shading and smudges a ribbon.
+
+    Wherever a part is frontmost, the original composite already holds its exact
+    pixels, so they can simply be copied back. Where a part is *behind* another,
+    the original holds the occluder instead and the inpainted reconstruction is
+    the only thing that knows what is under there -- which is precisely what a rig
+    needs once the limb moves. So this walks near-to-far and only claims pixels no
+    nearer part has taken.
+
+    Upstream applies the same idea to nose and mouth in ``further_extr``.
+
+    Returns new ``Part`` objects; the inputs are untouched.
+    """
+    if decomp.src_img is None or decomp.src_img.shape[2] < 4:
+        return ordered
+
+    cw, ch = decomp.canvas
+    src = decomp.src_img
+    claimed = np.zeros((ch, cw), dtype=bool)
+    out: list[Part] = list(ordered)
+
+    # Near to far: the last-drawn part is the one you actually see.
+    for i in range(len(ordered) - 1, -1, -1):
+        part = ordered[i]
+        x1, y1, x2, y2 = part.bbox
+        cx1, cy1 = max(0, x1), max(0, y1)
+        cx2, cy2 = min(cw, x2), min(ch, y2)
+        if cx2 <= cx1 or cy2 <= cy1:
+            continue
+
+        sx, sy = cx1 - x1, cy1 - y1
+        h, w = cy2 - cy1, cx2 - cx1
+        alpha = part.alpha[sy:sy + h, sx:sx + w]
+
+        solid = alpha >= s.source_pixel_alpha_floor
+        visible = solid & ~claimed[cy1:cy2, cx1:cx2]
+        claimed[cy1:cy2, cx1:cx2] |= alpha > 8
+
+        if not visible.any():
+            continue
+        rgba = part.rgba.copy()
+        window = rgba[sy:sy + h, sx:sx + w, :3]
+        window[visible] = src[cy1:cy2, cx1:cx2, :3][visible]
+        out[i] = Part(
+            name=part.name, rgba=rgba, offset=part.offset,
+            depth_median=part.depth_median, depth=part.depth,
+            synthetic=part.synthetic,
+            meta={**part.meta, "source_pixels": int(visible.sum())},
+        )
+    return out
+
+
 def _wants_mesh(part: Part) -> bool:
     # Anything the bone partition cut spans a joint by construction, and the
     # bulky garments deform. Everything else is a rigid feature.
@@ -603,6 +664,8 @@ def build_rig(
     warnings: list[str] = []
 
     ordered = _resolve_draw_order(parts, decomp)
+    if s.restore_source_pixels:
+        ordered = restore_source_pixels(ordered, decomp, s)
 
     for part in ordered:
         slug = naming.unique_slug(part.name)
