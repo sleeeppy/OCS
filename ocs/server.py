@@ -64,10 +64,28 @@ def _project(project_id: str) -> pipeline.Project:
 # --------------------------------------------------------------------------
 
 
+#: When this process imported its code. Compared against the source files so the
+#: UI can say "you are running stale code" instead of leaving the user to wonder
+#: why a fix had no effect -- Python does not re-import a module that is already
+#: loaded, so editing a file while the server runs changes nothing until restart.
+_STARTED_AT = time.time()
+
+
+def _stale_modules() -> list[str]:
+    package = Path(__file__).resolve().parent
+    return sorted(
+        p.name for p in package.glob("*.py")
+        if p.stat().st_mtime > _STARTED_AT
+    )
+
+
 @app.get("/api/health")
 def health() -> dict:
+    stale = _stale_modules()
     return {
         "ok": True,
+        "started_at": _STARTED_AT,
+        "stale_modules": stale,
         "environment": seethrough.check_environment(),
         "taxonomy": {
             "part_tags": list(taxonomy.PART_TAGS),

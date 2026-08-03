@@ -92,6 +92,14 @@ const App = (() => {
   async function loadEnvironment() {
     try {
       meta = await API.health();
+      // Stale code is the single most confusing failure mode in this loop: a fix
+      // lands on disk, the running server keeps the old module, and the same bug
+      // reappears with no explanation. Say so loudly.
+      if ((meta.stale_modules || []).length) {
+        Toast.err(`서버가 오래된 코드로 실행 중입니다 (${meta.stale_modules.join(", ")}). `
+                + "서버를 재시작하세요.");
+      }
+
       const e = meta.environment || {};
       const body = $("env-body");
       if (e.ok) {
