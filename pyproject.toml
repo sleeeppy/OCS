@@ -1,0 +1,38 @@
+[project]
+name = "ocs"
+version = "0.1.0"
+description = "OneClickSpine - illustration to rigged Spine skeleton in one pass"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "sleeeppy" }]
+
+# Deliberately unpinned. OCS shares a single virtualenv with the see-through
+# submodule, whose requirements.txt pins the heavy half of this list
+# (numpy, opencv-python, pillow, scipy, scikit-image, psd-tools[composite]).
+# Re-pinning here would fight those pins; scripts/setup_env.ps1 installs
+# see-through's requirements first and these on top.
+dependencies = [
+  "numpy",
+  "opencv-python",
+  "pillow",
+  "scipy",
+  "scikit-image",
+  "psd-tools[composite]",
+  "fastapi",
+  "uvicorn[standard]",
+  "python-multipart",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["ocs"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

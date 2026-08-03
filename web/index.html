@@ -1,0 +1,218 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OCS · OneClickSpine</title>
+<link rel="stylesheet" href="/static/css/ocs.css">
+
+<div id="app">
+  <aside id="sidebar">
+    <header class="brand">
+      <h1>OCS</h1>
+      <span>OneClickSpine</span>
+    </header>
+
+    <nav id="steps">
+      <button class="step" data-step="upload"><b>1</b><span>이미지 업로드</span></button>
+      <button class="step" data-step="review" disabled><b>2</b><span>레이어 정리</span></button>
+      <button class="step" data-step="bones" disabled><b>3</b><span>본 배치</span></button>
+      <button class="step" data-step="export" disabled><b>4</b><span>리깅 · 미리보기</span></button>
+    </nav>
+
+    <section id="env" class="card">
+      <h2>실행 환경</h2>
+      <div id="env-body" class="mono muted">확인 중…</div>
+    </section>
+
+    <section id="progress-card" class="card hidden">
+      <h2>진행 상태</h2>
+      <div class="bar"><i id="bar-fill"></i></div>
+      <div id="progress-msg" class="mono muted"></div>
+    </section>
+
+    <section id="warnings" class="card hidden">
+      <h2>경고</h2>
+      <ul id="warn-list"></ul>
+    </section>
+
+    <footer class="sidebar-foot muted">
+      <a href="https://github.com/sleeeppy/OCS" target="_blank" rel="noreferrer">sleeeppy/OCS</a>
+      · Apache-2.0
+    </footer>
+  </aside>
+
+  <main id="main">
+    <!-- ── step 1 ────────────────────────────────────────────────── -->
+    <section class="panel" data-panel="upload">
+      <div class="panel-head">
+        <h2>이미지 업로드</h2>
+        <p class="muted">캐릭터 일러스트 1장을 넣으면 레이어 분리 → 본 배치 → 리깅 → Spine 미리보기까지 진행합니다.</p>
+      </div>
+
+      <label id="drop" for="file-input">
+        <input type="file" id="file-input" accept="image/*" hidden>
+        <div class="drop-inner">
+          <div class="drop-icon">＋</div>
+          <b>이미지를 끌어다 놓거나 클릭</b>
+          <span class="muted">PNG · JPG · WEBP</span>
+          <span class="hint">투명 배경 PNG를 넣으면 실루엣이 정확해져 리깅 품질이 올라갑니다.</span>
+        </div>
+        <img id="drop-preview" alt="">
+      </label>
+
+      <details id="advanced">
+        <summary>고급 설정</summary>
+        <div class="grid">
+          <label>해상도
+            <select id="opt-resolution">
+              <option value="1024">1024 (빠름)</option>
+              <option value="1280" selected>1280 (권장)</option>
+              <option value="1536">1536 (VRAM 많이)</option>
+            </select>
+          </label>
+          <label>추론 스텝
+            <input type="number" id="opt-steps" value="30" min="8" max="60">
+          </label>
+          <label>시드
+            <input type="number" id="opt-seed" value="42">
+          </label>
+          <label class="check">
+            <input type="checkbox" id="opt-offload" checked>
+            group offload <span class="muted">(VRAM ~10GB)</span>
+          </label>
+        </div>
+      </details>
+
+      <div class="actions">
+        <button id="btn-start" class="primary" disabled>레이어 분리 시작</button>
+        <span class="muted" id="start-note">첫 실행은 모델 가중치(약 12GB) 다운로드로 오래 걸립니다.</span>
+      </div>
+
+      <div id="recent" class="card hidden">
+        <h2>최근 프로젝트</h2>
+        <ul id="recent-list"></ul>
+      </div>
+    </section>
+
+    <!-- ── step 2 ────────────────────────────────────────────────── -->
+    <section class="panel" data-panel="review">
+      <div class="panel-head">
+        <h2>레이어 정리</h2>
+        <p class="muted">
+          see-through는 빈 레이어를 걸러내지 않습니다. OCS가 확실한 더미는 자동 제외하고,
+          판단이 필요한 것만 <b>의심</b>으로 표시했습니다. 체크를 풀면 리깅에서 빠집니다.
+        </p>
+      </div>
+
+      <div class="toolbar">
+        <div id="review-stats" class="chips"></div>
+        <div class="spacer"></div>
+        <label class="check"><input type="checkbox" id="filter-suspicious"> 의심만 보기</label>
+        <button id="btn-drop-suspicious">의심 전부 제외</button>
+        <button id="btn-keep-all">전부 유지</button>
+      </div>
+
+      <div id="layer-grid" class="layer-grid"></div>
+
+      <details id="dropped-box">
+        <summary>자동 제외됨 <span id="dropped-count" class="muted"></span></summary>
+        <div id="dropped-grid" class="layer-grid"></div>
+      </details>
+
+      <div class="actions">
+        <button id="btn-to-bones" class="primary">본 배치로 →</button>
+      </div>
+    </section>
+
+    <!-- ── step 3 ────────────────────────────────────────────────── -->
+    <section class="panel wide" data-panel="bones">
+      <div class="panel-head row">
+        <div>
+          <h2>본 배치</h2>
+          <p class="muted">
+            노란 조인트를 끌어서 위치를 맞추세요. 이 위치가 그대로 좌·우 팔/다리를 자르는 기준선이 됩니다.
+          </p>
+        </div>
+        <div class="hotkeys mono muted">
+          드래그 이동 · <kbd>Shift</kbd>+드래그 하위까지 · <kbd>X</kbd> 좌우 미러 ·
+          <kbd>S</kbd> 대칭 스냅 · <kbd>휠</kbd> 줌 · <kbd>Space</kbd>+드래그 팬 · <kbd>0</kbd> 맞춤
+        </div>
+      </div>
+
+      <div class="editor-wrap">
+        <div id="canvas-host">
+          <canvas id="bone-canvas"></canvas>
+          <div id="canvas-hud" class="mono"></div>
+        </div>
+
+        <div id="bone-side">
+          <section class="card">
+            <h2>표시</h2>
+            <label class="check"><input type="checkbox" id="show-art" checked> 원본 아트</label>
+            <label class="check"><input type="checkbox" id="show-regions"> 본→파츠 분할 오버레이</label>
+            <label class="check"><input type="checkbox" id="show-labels" checked> 본 이름</label>
+            <label class="range">아트 밝기
+              <input type="range" id="art-dim" min="15" max="100" value="100">
+            </label>
+          </section>
+
+          <section class="card">
+            <h2>선택한 본</h2>
+            <div id="sel-body" class="mono muted">조인트를 클릭하세요</div>
+          </section>
+
+          <section class="card">
+            <h2>선택 본</h2>
+            <div id="optional-bones" class="opt-bones"></div>
+          </section>
+
+          <section class="card">
+            <h2>분할 검증</h2>
+            <div id="verify-body" class="mono muted">아직 계산하지 않았습니다</div>
+            <button id="btn-verify">분할 다시 계산</button>
+          </section>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="btn-reset-rig">자동 추정으로 되돌리기</button>
+        <div class="spacer"></div>
+        <button id="btn-export" class="primary">리깅 후 Spine 내보내기</button>
+      </div>
+    </section>
+
+    <!-- ── step 4 ────────────────────────────────────────────────── -->
+    <section class="panel wide" data-panel="export">
+      <div class="panel-head row">
+        <div>
+          <h2>리깅 결과</h2>
+          <p class="muted">Spine 4.2 스켈레톤 · 가중 메시 · 아틀라스 · 자체 완결 HTML 미리보기</p>
+        </div>
+        <div id="export-stats" class="chips"></div>
+      </div>
+
+      <div id="export-issues" class="card hidden">
+        <h2>확인 필요</h2>
+        <ul id="issue-list"></ul>
+      </div>
+
+      <div class="preview-wrap">
+        <iframe id="preview-frame" title="Spine preview"></iframe>
+      </div>
+
+      <div class="actions">
+        <a id="dl-skeleton" class="btn" download>skeleton.json</a>
+        <a id="dl-atlas" class="btn" download>skeleton.atlas</a>
+        <a id="dl-png" class="btn" download>skeleton.png</a>
+        <a id="dl-preview" class="btn" download>preview.html</a>
+        <div class="spacer"></div>
+        <a id="open-preview" class="btn primary" target="_blank" rel="noreferrer">새 탭에서 열기</a>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast"></div>
+
+<script src="/static/js/api.js"></script>
+<script src="/static/js/layerPanel.js"></script>
+<script src="/static/js/boneEditor.js"></script>
+<script src="/static/js/app.js"></script>

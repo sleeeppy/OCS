@@ -1,0 +1,39 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# --- OCS runtime artifacts ---
+# Per-project pipeline output: uploads, see-through PSDs, parts, atlas, exports.
+workspace/
+*.psd
+*.psb
+
+# see-through writes its own scratch dir when invoked with cwd=external/see-through
+external/see-through/workspace/
+
+# --- Spine Web Player runtime ---
+# NOT redistributed: the Spine Runtimes License restricts distribution, so the
+# runtime is fetched locally by scripts/fetch_spine_player.ps1 instead.
+web/vendor/spine-player.js
+web/vendor/spine-player.css
+
+# --- Model / HF caches (should never be committed) ---
+.cache/
+*.safetensors
+*.ckpt
+*.pth
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# --- Local overrides ---
+.env
+ocs.local.toml
