@@ -176,8 +176,15 @@ def _crop_to_part(
     depth_median: float,
     synthetic: bool = True,
     meta: dict | None = None,
+    min_opaque: int = 1,
 ) -> Part | None:
-    """Build a cropped ``Part`` from a canvas-sized RGBA + boolean mask."""
+    """Build a cropped ``Part`` from a canvas-sized RGBA + boolean mask.
+
+    ``min_opaque`` guards against the mask and the image disagreeing: the mask can
+    select thousands of pixels that turn out to be transparent in the source, so
+    a bare "any opaque pixel at all" check lets through parts that are nearly
+    empty inside a large bounding box.
+    """
     if not mask.any():
         return None
     ys, xs = np.nonzero(mask)
@@ -186,7 +193,7 @@ def _crop_to_part(
     rgba = canvas_rgba[y1:y2, x1:x2].copy()
     sub = mask[y1:y2, x1:x2]
     rgba[..., 3] = np.where(sub, rgba[..., 3], 0)
-    if not (rgba[..., 3] > 0).any():
+    if int((rgba[..., 3] > 8).sum()) < max(1, min_opaque):
         return None
 
     return Part(
@@ -225,11 +232,23 @@ def _clean_mask(mask: np.ndarray, min_area: int, open_px: int = 1) -> np.ndarray
 def skin_base_mask(
     decomp: Decomposition, parts: list[Part], silhouette: np.ndarray, min_area: int
 ) -> np.ndarray:
-    """Silhouette minus every extracted layer: the skin see-through never emits."""
+    """Silhouette minus every extracted layer: the skin see-through never emits.
+
+    Intersected with the source's own opaque pixels, which is not redundant. The
+    silhouette is morphologically closed and hole-filled, so it reaches a few
+    pixels beyond the artwork; that margin belongs to no layer and therefore
+    reads as "uncovered skin". Measured on a real run it produced four hairline
+    parts -- a 23x178 bounding box holding 75 opaque pixels -- whose contours
+    then collapsed below three points and failed to mesh.
+    """
     covered = np.zeros_like(silhouette)
     for p in parts:
         covered |= p.canvas_mask(decomp.canvas)
-    return _clean_mask(silhouette & ~covered, min_area=min_area, open_px=2)
+
+    skin = silhouette & ~covered
+    if decomp.src_img is not None and decomp.src_img.shape[2] >= 4:
+        skin &= decomp.src_img[..., 3] > 8
+    return _clean_mask(skin, min_area=min_area, open_px=2)
 
 
 def _skin_depth(parts: list[Part]) -> float:
@@ -398,6 +417,7 @@ def partition(
             p = _crop_to_part(
                 naming.skin(spec.name), decomp.src_img, sel, depth,
                 synthetic=True, meta={"origin": "skin_base", "region": spec.name},
+                min_opaque=min_area,
             )
             if p is not None:
                 result.append(p)

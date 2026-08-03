@@ -29,11 +29,29 @@ from pathlib import Path
 from .config import SPINE_VERSION
 from .rig import RigResult
 
-# Bezier control points for a standard ease. Spine curve format is
-# [cx1, cy1, cx2, cy2] per keyframe transition.
-EASE = [0.25, 0, 0.75, 1]
-EASE_OUT = [0.4, 0, 1, 1]
-EASE_IN = [0, 0, 0.6, 1]
+#: How far along the segment the bezier handles sit. 0.25/0.75 is the smooth
+#: ease-in-out the Spine editor emits.
+_EASE = 0.25
+
+#: Value channels per bone timeline, which fixes how long each ``curve`` must be.
+#: ``readCurve`` indexes it as ``i = value << 2``, so a two-channel timeline needs
+#: 8 numbers: x's handles then y's.
+_TIMELINE_CHANNELS = {
+    "rotate": 1, "translatex": 1, "translatey": 1, "scalex": 1, "scaley": 1,
+    "shearx": 1, "sheary": 1,
+    "translate": 2, "scale": 2, "shear": 2,
+}
+
+
+def _handles(t1: float, v1: float, t2: float, v2: float) -> list[float]:
+    """Bezier handles for one value channel, in **absolute** (time, value) space.
+
+    Not normalised 0..1. ``readCurve`` uses ``curve[i]`` directly as a time and
+    ``curve[i+1]`` as a value, so normalised numbers describe a curve through
+    unrelated coordinates.
+    """
+    dt = t2 - t1
+    return [t1 + dt * _EASE, v1, t1 + dt * (1.0 - _EASE), v2]
 
 
 def _hash(payload: dict) -> str:
@@ -93,6 +111,8 @@ def build_skeleton(rig: RigResult, name: str = "character", images: str = "./ima
                 "width": round(att.width, 1),
                 "height": round(att.height, 1),
             }
+            if abs(att.region_rotation) > 1e-6:
+                body["rotation"] = round(att.region_rotation, 3)
         attachments[slot.name] = {att.name: body}
 
     doc = {
@@ -129,12 +149,23 @@ def _rot(*frames: tuple[float, float]) -> list[dict]:
         if t:
             kf["time"] = round(t, 4)
         if i < len(frames) - 1:
-            kf["curve"] = list(EASE)
+            t2, v2 = frames[i + 1]
+            kf["curve"] = [round(c, 5) for c in _handles(t, v, t2, v2)]
         out.append(kf)
     return out
 
 
 def _trans(*frames: tuple[float, float, float]) -> list[dict]:
+    """Translation timeline from (time, x, y) triples.
+
+    The ``curve`` here carries **8** numbers, not 4. A translate timeline has two
+    value channels and ``readCurve`` is called once per channel with
+    ``i = value << 2``, so x reads ``curve[0:4]`` and y reads ``curve[4:8]``.
+    Emitting only 4 leaves y reading ``undefined``, and ``undefined * scale`` is
+    NaN -- which lands in the bezier table, makes the bone's translation NaN, and
+    propagates through every descendant's world transform. The visible symptom is
+    the player refusing to start with "Animation bounds are invalid".
+    """
     out: list[dict] = []
     for i, (t, x, y) in enumerate(frames):
         kf: dict = {}
@@ -145,7 +176,11 @@ def _trans(*frames: tuple[float, float, float]) -> list[dict]:
         if abs(y) > 1e-6:
             kf["y"] = round(y, 3)
         if i < len(frames) - 1:
-            kf["curve"] = list(EASE)
+            t2, x2, y2 = frames[i + 1]
+            kf["curve"] = [
+                round(c, 5)
+                for c in _handles(t, x, t2, x2) + _handles(t, y, t2, y2)
+            ]
         out.append(kf)
     return out
 
@@ -391,8 +426,53 @@ def validate(doc: dict) -> list[str]:
                     problems.append(f"{att_name}: {count} weighted vertices for {n} uvs")
 
     for anim_name, anim in doc.get("animations", {}).items():
-        for bone_name in anim.get("bones", {}):
+        for bone_name, timelines in anim.get("bones", {}).items():
             if bone_name not in bone_set:
                 problems.append(f"animation {anim_name}: unknown bone {bone_name}")
+            for timeline_name, keys in timelines.items():
+                channels = _TIMELINE_CHANNELS.get(timeline_name)
+                if channels is None:
+                    problems.append(
+                        f"animation {anim_name}/{bone_name}: unknown timeline "
+                        f"'{timeline_name}'"
+                    )
+                    continue
+                # A curve short by one channel is the worst kind of bug: the
+                # document parses, then the runtime reads past the end, gets
+                # undefined, and NaN spreads through every descendant bone.
+                want = channels * 4
+                for i, key in enumerate(keys):
+                    curve = key.get("curve")
+                    if curve is None or curve == "stepped":
+                        continue
+                    if not isinstance(curve, list) or len(curve) != want:
+                        problems.append(
+                            f"animation {anim_name}/{bone_name}/{timeline_name} "
+                            f"key {i}: curve has "
+                            f"{len(curve) if isinstance(curve, list) else curve} "
+                            f"values, needs {want} ({channels} channel(s) x 4)"
+                        )
+                if keys and keys[-1].get("curve") is not None:
+                    problems.append(
+                        f"animation {anim_name}/{bone_name}/{timeline_name}: last "
+                        "key has a curve but nothing follows it"
+                    )
 
+    problems.extend(_non_finite(doc))
     return problems
+
+
+def _non_finite(node, path: str = "$") -> list[str]:
+    """Every non-finite float, with its path. NaN is not valid JSON."""
+    import math
+
+    out: list[str] = []
+    if isinstance(node, dict):
+        for k, v in node.items():
+            out.extend(_non_finite(v, f"{path}.{k}"))
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            out.extend(_non_finite(v, f"{path}[{i}]"))
+    elif isinstance(node, float) and not math.isfinite(node):
+        out.append(f"non-finite value at {path}: {node}")
+    return out

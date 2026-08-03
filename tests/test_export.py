@@ -173,6 +173,109 @@ def test_mirrored_limbs_animate_with_opposite_signs(figure):
     assert left * right < 0, f"left={left} right={right} should oppose"
 
 
+def test_curve_arity_matches_the_timeline_channel_count(figure):
+    """A translate curve needs 8 numbers, a rotate curve 4.
+
+    The runtime reads channel ``n`` at ``curve[n*4 : n*4+4]``, so a translate
+    timeline carrying only 4 reads ``undefined`` for y. ``undefined * scale`` is
+    NaN, it lands in the bezier table, and every descendant bone's world
+    transform becomes NaN -- which surfaces only as the player refusing to start
+    with "Animation bounds are invalid". Nothing else catches it: the JSON is
+    well-formed and every number in it is finite.
+    """
+    built, _ = build(figure)
+    doc = spine_export.build_skeleton(built)
+    spine_export.add_animations(doc, built)
+
+    seen = set()
+    for anim_name, anim in doc["animations"].items():
+        for bone_name, timelines in anim["bones"].items():
+            for timeline_name, keys in timelines.items():
+                channels = spine_export._TIMELINE_CHANNELS[timeline_name]
+                seen.add(timeline_name)
+                for i, key in enumerate(keys):
+                    curve = key.get("curve")
+                    if curve is None:
+                        assert i == len(keys) - 1, (
+                            f"{anim_name}/{bone_name}/{timeline_name} key {i} has no curve"
+                        )
+                        continue
+                    assert len(curve) == channels * 4, (
+                        f"{anim_name}/{bone_name}/{timeline_name} key {i}: "
+                        f"{len(curve)} values for {channels} channel(s)"
+                    )
+    assert {"rotate", "translate"} <= seen, "fixture exercises both arities"
+
+
+def test_curve_handles_are_absolute_coordinates(figure):
+    """Handles are (time, value) points, not normalised 0..1 fractions.
+
+    ``readCurve`` uses ``curve[i]`` directly as a time and ``curve[i+1]`` as a
+    value, so handles must lie between the two keyframes they interpolate.
+    """
+    built, _ = build(figure)
+    doc = spine_export.build_skeleton(built)
+    spine_export.add_animations(doc, built, ["idle"])
+
+    checked = 0
+    for bone_name, timelines in doc["animations"]["idle"]["bones"].items():
+        for timeline_name, keys in timelines.items():
+            channels = spine_export._TIMELINE_CHANNELS[timeline_name]
+            for i, key in enumerate(keys[:-1]):
+                t1 = key.get("time", 0.0)
+                t2 = keys[i + 1].get("time", 0.0)
+                curve = key["curve"]
+                for c in range(channels):
+                    cx1, cx2 = curve[c * 4], curve[c * 4 + 2]
+                    assert t1 <= cx1 <= t2, f"{bone_name}/{timeline_name}: cx1 {cx1} outside [{t1},{t2}]"
+                    assert t1 <= cx2 <= t2, f"{bone_name}/{timeline_name}: cx2 {cx2} outside [{t1},{t2}]"
+                    assert cx1 <= cx2
+                    checked += 1
+    assert checked, "no curves were checked"
+
+
+def test_validate_rejects_a_short_translate_curve(figure):
+    built, _ = build(figure)
+    doc = spine_export.build_skeleton(built)
+    spine_export.add_animations(doc, built, ["idle"])
+    assert spine_export.validate(doc) == []
+
+    doc["animations"]["idle"]["bones"]["torso"]["translate"][0]["curve"] = [0.1, 0, 0.3, 1]
+    problems = spine_export.validate(doc)
+    assert any("needs 8" in p for p in problems), problems
+
+
+def test_validate_rejects_non_finite_numbers(figure):
+    built, _ = build(figure)
+    doc = spine_export.build_skeleton(built)
+    doc["bones"][1]["x"] = float("nan")
+    assert any("non-finite" in p for p in spine_export.validate(doc))
+
+
+def test_region_attachments_counter_rotate_their_bone(figure):
+    """A region inherits its bone's world rotation, so it must cancel it out.
+
+    Every bone is aimed down its own length, so without this a face rides at 73
+    degrees and a shin lies on its side.
+    """
+    built, _ = build(figure)
+    doc = spine_export.build_skeleton(built)
+    by_name = {b.name: b for b in built.bones}
+    slot_bone = {s.name: s.bone for s in built.slots}
+
+    checked = 0
+    for slot_name, entries in doc["skins"][0]["attachments"].items():
+        for _att_name, body in entries.items():
+            if body.get("type") == "mesh":
+                continue
+            bone = by_name[slot_bone[slot_name]]
+            got = body.get("rotation", 0.0)
+            expected = ((-bone.world_rot + 180) % 360) - 180
+            assert abs(got - expected) < 0.01, f"{slot_name}: {got} != {expected}"
+            checked += 1
+    assert checked, "fixture produced no region attachments"
+
+
 def test_validate_catches_a_broken_document(figure):
     built, _ = build(figure)
     doc = spine_export.build_skeleton(built)

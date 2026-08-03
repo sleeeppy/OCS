@@ -86,6 +86,7 @@ class Attachment:
     #: region only
     region_x: float = 0.0
     region_y: float = 0.0
+    region_rotation: float = 0.0
     #: bone indices referenced by this attachment (mesh) or its parent bone
     bones_used: list[int] = field(default_factory=list)
 
@@ -450,14 +451,21 @@ def _mesh_attachment(
 def _region_attachment(
     part: Part, slug: str, bone: BoneTransform, origin: tuple[float, float]
 ) -> Attachment:
-    """Rigid quad, centred on the part's own middle, expressed in bone space."""
+    """Rigid quad, centred on the part's own middle, expressed in bone space.
+
+    ``rotation`` counter-rotates the bone's setup angle. A region attachment
+    inherits its bone's world rotation, and OCS aims every bone down its own
+    length, so without this the sprite is drawn turned by that angle -- a face
+    tilted 73 degrees, a shin lying on its side. Meshes do not need it because
+    their vertices are already baked into bone-local space.
+    """
     w, h = part.size
     ox, oy = part.offset
     centre_px = (ox + w / 2.0, oy + h / 2.0)
     lx, ly = _to_bone_local(px_to_spine(centre_px, origin), bone)
     return Attachment(
         name=slug, kind="region", width=float(w), height=float(h),
-        region_x=lx, region_y=ly,
+        region_x=lx, region_y=ly, region_rotation=_norm_deg(-bone.world_rot),
     )
 
 
