@@ -8,6 +8,7 @@ else is fast enough to answer inline.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import queue
 import threading
@@ -15,7 +16,9 @@ import time
 from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 
 from . import pipeline, seethrough, taxonomy
@@ -303,7 +306,23 @@ app.mount("/files", StaticFiles(directory=str(PROJECTS_DIR)), name="files")
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
 
-@app.get("/", response_class=HTMLResponse)
+#: A 1x1 transparent GIF. Browsers request /favicon.ico unprompted, and a 404 in
+#: the log on every page load is noise that hides real problems.
+_FAVICON = base64.b64decode(
+    b"R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon() -> Response:
+    return Response(_FAVICON, media_type="image/gif",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+# HEAD as well as GET: readiness probes (including the one that launches this
+# server) send HEAD, and a GET-only route answers 405, which reads like a
+# failure in the startup log.
+@app.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse)
 def index() -> HTMLResponse:
     path = Path(WEB_DIR) / "index.html"
     if not path.exists():
