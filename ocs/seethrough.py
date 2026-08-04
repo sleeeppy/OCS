@@ -39,6 +39,16 @@ ProgressFn = Callable[[str, float | None], None]
 _PCT = re.compile(r"(\d{1,3})%\|")
 _STEP = re.compile(r"(\d+)/(\d+)")
 
+#: How many denoise loops ``apply_layerdiff`` runs, per pass, for tag v3.
+#:
+#: Two, not one. The first covers the body tag list; the second re-runs the whole
+#: schedule on a crop around the head for ``headwear, face, irides, eyebrow,
+#: eyewhite, eyelash, eyewear, ears, earwear, nose, mouth`` (inference_utils.py,
+#: the ``tag_version == 'v3'`` branch). Both report as ``n/30``, so a parser that
+#: assumes one loop climbs to 60% and then jumps *backwards* to 18% when the
+#: second starts -- which is exactly what the UI did.
+_LAYERDIFF_PASSES = 2
+
 
 class SeeThroughError(RuntimeError):
     pass
@@ -164,6 +174,10 @@ def run_inference(
             text=True, encoding="utf-8", errors="replace", bufsize=1,
         )
         phase, base = "starting", 0.01
+        # Which denoise loop we are in, so two passes over n/30 scale into one bar
+        # rather than the second restarting it. A step lower than the last is the
+        # only available signal that a new loop began.
+        loop, last_step, reported = 0, 0, 0.0
         for line in _stream(proc):
             if log:
                 log.write(line + "\n")
@@ -171,16 +185,34 @@ def run_inference(
             found = _phase_of(line)
             if found:
                 phase, base = found
+                loop, last_step, reported = 0, 0, base
                 if on_progress:
                     on_progress(phase, base)
                 continue
             if on_progress:
                 m = _PCT.search(line) or _STEP.search(line)
                 if m:
-                    frac = (int(m.group(1)) / 100.0 if "%" in m.group(0)
-                            else int(m.group(1)) / max(1, int(m.group(2))))
+                    if "%" in m.group(0):
+                        frac = int(m.group(1)) / 100.0
+                    else:
+                        step, total = int(m.group(1)), max(1, int(m.group(2)))
+                        if step < last_step:
+                            loop += 1
+                        last_step = step
+                        frac = step / total
+                    passes = _LAYERDIFF_PASSES if phase == "layerdiff" else 1
+                    frac = min(1.0, (min(loop, passes - 1) + frac) / passes)
                     span = 0.55 if phase == "layerdiff" else 0.35
-                    on_progress(phase, min(0.97, base + span * frac))
+                    value = min(0.97, base + span * frac)
+                    # Monotonic within a phase. _STEP's (\d+)/(\d+) also matches
+                    # unrelated bars -- "Loading weights: 517/517", "components:
+                    # 5/5" -- which interleave with the denoise steps and would
+                    # otherwise drag the bar backwards. Counting loops alone left
+                    # four such reversals on a real log; refusing to go backwards
+                    # removes all of them without having to classify every bar.
+                    if value >= reported:
+                        reported = value
+                        on_progress(phase, value)
         code = proc.wait()
     finally:
         if log:

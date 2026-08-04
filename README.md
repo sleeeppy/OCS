@@ -257,6 +257,39 @@ builds a pinned-memory dict, and `Tensor.pin_memory()` fails on this machine
 different device mps:0"*). see-through never passes `use_stream`, so the default
 already avoids it; the wrapper pins it off regardless.
 
+### The allocator ceiling matters more than anything else here
+
+`PYTORCH_MPS_HIGH_WATERMARK_RATIO` defaults to **1.7**, relative to
+`recommended_max_memory()`. On this machine that authorises a **30.2 GB**
+allocator on **24 GB** of RAM, and the driver uses it: measured at 30.9 GB
+allocated with the system 25.7 GB into swap. The process `phys_footprint` stayed
+at a healthy 13 GB the whole time, which is why the obvious diagnostic says
+nothing is wrong — the growth is in the driver's cache, not the process heap.
+
+It presents as step time climbing without bound while the GPU stays busy:
+
+| step | s/it |
+|---|---|
+| 1–2 | 22 |
+| 20 | 153 |
+| 21 | 356 |
+| 23 | 427 (51 min in, never reached 30) |
+
+`configure_mps_env` derives the ceiling from physical RAM instead. The budget is
+under half, and that is deliberate: **on unified memory the MPS allocator and
+"CPU" memory are the same 24 GB**, so group offloading does not lower total
+demand — it moves the ~8 GB of weights into CPU-resident copies that still occupy
+RAM. Sizing the allocator as if it were the only consumer produced a 14.9 GB
+ceiling that still collapsed (14.9 + 8 + OS > 24), which is why steps 1–20 looked
+fine and step 21 fell over every time. It now lands at ~10.8 GB, for ~18.8 GB
+total.
+
+Expect roughly **15–20 s/it at 768**, so ~8–12 minutes of denoise per image, plus
+the depth pass. A discrete card does the same work in about two minutes. The cost
+is not really MPS being slow — LayerDiff **3D** generates all the layers as frames
+in one batch, so a step is an SDXL step at batch ~23. Halve `inference_steps` if
+you want it faster.
+
 `OCS_TORCH_DEVICE=cpu` forces the device choice if a driver bug shows up mid-run.
 
 ## Without a GPU
