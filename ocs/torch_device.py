@@ -162,9 +162,8 @@ def cap_resolution(resolution: int, device: "object") -> tuple[int, str | None]:
     if resolution <= MPS_MAX_RESOLUTION:
         return resolution, None
     return MPS_MAX_RESOLUTION, (
-        f"resolution {resolution} -> {MPS_MAX_RESOLUTION}: MPS materialises "
-        f"attention scores, and {resolution} needs more than the "
-        f"{MPS_MAX_RESOLUTION} cap allows on this device "
+        f"{resolution} -> {MPS_MAX_RESOLUTION}: MPS materialises attention "
+        f"scores, so {resolution} needs more memory than this device has "
         "(see ocs.torch_device.MPS_MAX_RESOLUTION)"
     )
 
@@ -334,8 +333,20 @@ def redirect_cuda_to(device: "object") -> None:
     _PATCHED = True
 
 
-#: Fraction of physical RAM the MPS allocator may hold. The rest is the OS's.
-_MPS_RAM_BUDGET = 0.62
+#: Fraction of physical RAM the MPS allocator may hold.
+#:
+#: Deliberately under half, and the reason is the part that is easy to get wrong:
+#: on unified memory the MPS allocator and "CPU" memory are the *same* 24 GB, so
+#: group offloading does not reduce total demand -- it moves the SDXL weights
+#: (~8 GB) out of the MPS allocator and into CPU-resident copies that still occupy
+#: physical RAM. The budget therefore has to cover only what stays on-device
+#: (activations, and whichever block is paged in), not the whole model.
+#:
+#: Sizing it as if the allocator were the only consumer is what produced a 14.9 GB
+#: ceiling that still collapsed: 14.9 + ~8 GB offloaded + the OS overruns 24 GB,
+#: which showed up as steps 1-20 running at 28-38 s/it and step 21 jumping to
+#: 295 s/it as the system finally started paging.
+_MPS_RAM_BUDGET = 0.45
 
 
 def configure_mps_env() -> dict[str, str]:

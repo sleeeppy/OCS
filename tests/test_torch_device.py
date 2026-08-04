@@ -331,3 +331,41 @@ def test_sort_guard_leaves_cpu_tensors_alone():
     r = torch.median(x, dim=0)
     assert r.values.device.type == "cpu"
     assert torch.allclose(r.values, torch.median(x, dim=0).values)
+
+
+def test_signal_exits_are_named_not_shown_as_negative_codes():
+    from ocs.seethrough import _describe_exit
+
+    # "exited -15" sends the reader hunting for a see-through bug that isn't one.
+    assert "SIGTERM" in _describe_exit(-15)
+    assert "terminated externally" in _describe_exit(-15)
+    assert "out-of-memory" in _describe_exit(-9)
+    assert _describe_exit(1) == "inference_psd.py exited 1"
+
+
+def test_error_tail_strips_progress_noise(tmp_path):
+    """Dropping --disable_progressbar made the raw tail a wall of tqdm redraws."""
+    from ocs.seethrough import _error_tail
+
+    log = tmp_path / "seethrough.log"
+    log.write_text(
+        "\n".join(
+            ["Loading weights: 100%|####| 517/517 [00:00<00:00, 7060.70it/s]"] * 50
+            + ["  4%|#   | 1/30 [01:08<32:59, 68.24s/it]"] * 50
+            + ["Traceback (most recent call last):", "RuntimeError: the real cause"]
+        ),
+        encoding="utf-8",
+    )
+    tail = _error_tail(log)
+    assert "RuntimeError: the real cause" in tail
+    assert "Traceback" in tail
+    assert "it/s" not in tail and "s/it" not in tail
+
+
+def test_error_tail_says_so_when_there_is_nothing_useful(tmp_path):
+    from ocs.seethrough import _error_tail
+
+    log = tmp_path / "seethrough.log"
+    log.write_text("Loading weights: 100%|####| 1/1 [00:00<00:00, 10it/s]\n")
+    assert "no diagnostic output" in _error_tail(log)
+    assert _error_tail(None) == ""

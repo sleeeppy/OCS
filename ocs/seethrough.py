@@ -56,6 +56,52 @@ def _stream(proc: subprocess.Popen) -> Iterator[str]:
         yield raw.rstrip("\r\n")
 
 
+#: tqdm redraw lines. Useful for the progress bar, useless in an error message --
+#: and there are thousands of them, so an unfiltered tail is nothing else.
+_NOISE = re.compile(r"it/s|s/it|Materializing|^\s*$|\x1b\[|^\s*\[A")
+
+
+def _describe_exit(code: int) -> str:
+    """Explain an exit status in the terms the reader needs.
+
+    A negative code is a signal, not a status, and "exited -15" invites a hunt for
+    a bug that is not there: 15 is SIGTERM, i.e. something outside stopped it.
+    """
+    if code < 0:
+        import signal
+
+        try:
+            name = signal.Signals(-code).name
+        except ValueError:
+            name = f"signal {-code}"
+        hint = " (terminated externally, not a see-through failure)" if -code in (
+            signal.SIGTERM, signal.SIGINT
+        ) else ""
+        if -code == signal.SIGKILL:
+            hint = " (killed - usually the OS out-of-memory killer)"
+        return f"see-through was stopped by {name}{hint}"
+    return f"inference_psd.py exited {code}"
+
+
+def _error_tail(log_path: str | Path | None, lines: int = 20) -> str:
+    """Last meaningful lines of the log, with the progress redraws stripped.
+
+    Dropping ``--disable_progressbar`` gave the UI a real progress bar and gave
+    this a 4000-line log of tqdm redraws, so the raw tail showed a wall of
+    ``Loading weights: 100%|###`` instead of the reason. Filter first.
+    """
+    if not log_path or not Path(log_path).exists():
+        return ""
+    raw = Path(log_path).read_text(encoding="utf-8", errors="replace")
+    kept = [
+        ln.rstrip() for ln in raw.replace("\r", "\n").splitlines()
+        if ln.strip() and not _NOISE.search(ln)
+    ]
+    if not kept:
+        return "(no diagnostic output; see the full log)"
+    return "\n".join(kept[-lines:])
+
+
 def _phase_of(line: str) -> tuple[str, float] | None:
     low = line.lower()
     if "running layerdiff" in low:
@@ -141,10 +187,7 @@ def run_inference(
             log.close()
 
     if code != 0:
-        tail = ""
-        if log_path and Path(log_path).exists():
-            tail = "\n".join(Path(log_path).read_text(encoding="utf-8").splitlines()[-25:])
-        raise SeeThroughError(f"inference_psd.py exited {code}\n{tail}")
+        raise SeeThroughError(f"{_describe_exit(code)}\n{_error_tail(log_path)}")
 
     psd = psd_path_for(image_path, save_dir)
     if not psd.exists():
