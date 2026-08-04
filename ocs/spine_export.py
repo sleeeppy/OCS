@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 
 from .config import SPINE_VERSION
@@ -328,13 +329,129 @@ PRESETS = {
 }
 
 
+def limb_swing_caps(rig: RigResult) -> dict[str, float]:
+    """Largest rotation each limb root may take before the limb hits something.
+
+    The presets are written as a side-on figure would move, and most illustrations
+    are drawn front-on. Seen from the front, rotating a leg about the hip does not
+    swing it forward -- it swings it *sideways across the body*, and the amplitude
+    that looks like a stride from the side makes the legs cross.
+
+    Measured on this character: hips 34 px apart, legs 396 px long, so the walk
+    preset's +-16 deg moves each foot 109 px sideways. Two feet closing 218 px
+    across a 34 px gap cross, every time. Nothing about the meshes is wrong; the
+    amplitude is geometrically impossible.
+
+    So each limb gets a cap from the rig it is actually attached to:
+
+    - legs: the pair must not close more than the hip separation, so
+      ``asin(hip_gap / (2 * leg_len))``.
+    - arms: the hand must not swing past the body midline, so
+      ``asin(shoulder_offset / arm_len)``.
+
+    The cap is **directional**. Only the rotation that swings a limb *toward* the
+    body collides; lifting an arm away is free, and a wave that raises it 110 deg
+    is exactly what a wave should do. Capping both signs would flatten every
+    gesture into a twitch. Which sign is inward is measured from the bone's own
+    aim direction rather than assumed, because bones point down their own length
+    and the two sides do not mirror (see ``_sym``).
+
+    Returns ``{bone: (max_negative, max_positive)}`` in degrees, 180 where free.
+    """
+    pos = {b.name: (b.world_x, b.world_y) for b in rig.bones}
+    aim = {b.name: b.world_rot for b in rig.bones}
+
+    def dist(a: str, b: str) -> float:
+        if a not in pos or b not in pos:
+            return 0.0
+        return math.dist(pos[a], pos[b])
+
+    def cap(clearance: float, length: float) -> float:
+        if length <= 1e-6:
+            return 180.0
+        ratio = max(0.0, min(1.0, clearance / length))
+        return math.degrees(math.asin(ratio))
+
+    midline = pos["torso"][0] if "torso" in pos else 0.0
+
+    def directional(bone: str, clearance: float, length: float) -> tuple[float, float]:
+        """(max_negative, max_positive) for ``bone``, limiting only the inward sign.
+
+        A positive rotation moves the bone's tip by ``(-sin, cos) * length``, so the
+        sign of ``-sin(world_rot)`` says which way its x travels. Inward is toward
+        the midline; that direction gets the geometric cap and the other stays free.
+        """
+        limit = cap(clearance, length)
+        dx_for_positive = -math.sin(math.radians(aim.get(bone, -90.0)))
+        toward_midline = 1.0 if pos[bone][0] < midline else -1.0
+        # Positive rotation is inward when its x-travel points at the midline.
+        if dx_for_positive * toward_midline > 0:
+            return 180.0, limit
+        return limit, 180.0
+
+    caps: dict[str, tuple[float, float]] = {}
+
+    # --- legs -------------------------------------------------------------
+    if "leftLeg" in pos and "rightLeg" in pos:
+        hip_gap = abs(pos["leftLeg"][0] - pos["rightLeg"][0])
+        for side in ("left", "right"):
+            leg, knee, foot = f"{side}Leg", f"{side}Knee", f"{side}Foot"
+            length = dist(leg, foot) or dist(leg, knee) * 2.0
+            # Both legs move, so each may only spend half the gap.
+            caps[leg] = directional(leg, hip_gap / 2.0, length)
+            if knee in pos:
+                caps[knee] = directional(
+                    knee, hip_gap, dist(knee, foot) or length / 2.0)
+
+    # --- arms -------------------------------------------------------------
+    for side in ("left", "right"):
+        arm, elbow, hand = f"{side}Arm", f"{side}Elbow", f"{side}Hand"
+        if arm not in pos:
+            continue
+        clearance = abs(pos[arm][0] - midline)
+        length = dist(arm, hand) or dist(arm, elbow) * 2.0
+        caps[arm] = directional(arm, clearance, length)
+        if elbow in pos:
+            caps[elbow] = directional(
+                elbow, clearance, dist(elbow, hand) or length / 2.0)
+    return caps
+
+
+def _clamp_rotations(data: dict, caps: dict[str, float]) -> dict:
+    """Scale each rotate timeline down to its bone's cap, keeping its shape.
+
+    Scaled rather than clipped: clipping flattens the peaks into a hold, which
+    reads as a stutter. Scaling keeps the motion's timing and just makes it
+    smaller.
+    """
+    for bone, timelines in (data.get("bones") or {}).items():
+        bounds = caps.get(bone)
+        keys = timelines.get("rotate")
+        if bounds is None or not keys:
+            continue
+        neg_limit, pos_limit = bounds
+        worst = 1.0
+        for k in keys:
+            v = k.get("value", 0.0)
+            limit = pos_limit if v > 0 else neg_limit
+            if abs(v) > limit > 1e-6:
+                worst = min(worst, limit / abs(v))
+        if worst >= 1.0:
+            continue
+        for k in keys:
+            if "value" in k:
+                k["value"] = round(k["value"] * worst, 3)
+    return data
+
+
 def add_animations(doc: dict, rig: RigResult, names: list[str] | None = None) -> dict:
     available = {b.name for b in rig.bones}
+    caps = limb_swing_caps(rig)
     for name in (names if names is not None else list(PRESETS)):
         gen = PRESETS.get(name)
         if gen is None:
             continue
-        data = gen(available)
+        data = _clamp_rotations(gen(available), caps)
         if data.get("bones"):
             doc["animations"][name] = data
     return doc
