@@ -205,12 +205,19 @@ def run_separation(project: Project, on_progress=None) -> Project:
     """see-through -> cleanup report -> initial rig. The slow stage."""
     s = project.settings()
 
+    started = time.time()
+
     def progress(phase: str, frac: float | None) -> None:
+        # Elapsed time is reported on every tick because see-through has long
+        # stretches with no output at all, and a bar that has not moved is
+        # indistinguishable from a hung job without it.
+        project.state["elapsed_s"] = int(time.time() - started)
         project.set_stage(STAGE_SEPARATING, f"see-through: {phase}",
-                          None if frac is None else 0.05 + 0.75 * frac)
+                          None if frac is None else frac)
         if on_progress:
             on_progress(project.state)
 
+    project.state["elapsed_s"] = 0
     project.set_stage(STAGE_SEPARATING, "starting", 0.02)
     if on_progress:
         on_progress(project.state)

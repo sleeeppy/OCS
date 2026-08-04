@@ -54,9 +54,12 @@ const App = (() => {
     const active = ["separating", "exporting"].includes(state.stage);
     card.classList.toggle("hidden", !active && state.stage !== "failed");
     $("bar-fill").style.width = `${Math.round((state.progress || 0) * 100)}%`;
+    const elapsed = state.elapsed_s
+      ? ` · ${Math.floor(state.elapsed_s / 60)}분 ${state.elapsed_s % 60}초 경과`
+      : "";
     $("progress-msg").textContent = state.stage === "failed"
       ? translateWarning(state.error || "실패")
-      : `${state.stage} · ${state.message || ""}`;
+      : `${state.message || state.stage}${active ? elapsed : ""}`;
     $("progress-msg").style.color = state.stage === "failed" ? "var(--danger)" : "";
     // A failed separation is almost always retryable, so give it a button rather
     // than leaving the user with a dead progress bar.

@@ -12,9 +12,10 @@ from the editable ``common`` install, and its default paths are relative.
 from __future__ import annotations
 
 import os
-import re
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -22,10 +23,14 @@ from .config import PYTHON, SEE_THROUGH_DIR, SeeThroughSettings
 
 ProgressFn = Callable[[str, float | None], None]
 
-#: tqdm/diffusers write "  35%|###   | 7/20" to stderr; pull the fraction out so
-#: the UI can show a real bar instead of a spinner.
-_PCT = re.compile(r"(\d{1,3})%\|")
-_STEP = re.compile(r"(\d+)/(\d+)")
+#: How many layer PNGs ``apply_layerdiff`` writes on the v3 path: 13 from the body
+#: pass plus 11 from the head-crop pass.
+LAYERDIFF_OUTPUTS = 24
+#: Roughly how many ``{tag}_depth.png`` files ``apply_marigold`` writes.
+MARIGOLD_OUTPUTS = 23
+
+#: Fraction of the bar each phase owns.
+_PHASE_SPAN = {"layerdiff": (0.04, 0.56), "marigold": (0.60, 0.36)}
 
 
 class SeeThroughError(RuntimeError):
@@ -44,15 +49,82 @@ def _stream(proc: subprocess.Popen) -> Iterator[str]:
         yield raw.rstrip("\r\n")
 
 
-def _phase_of(line: str) -> tuple[str, float] | None:
+def _phase_of(line: str) -> str | None:
     low = line.lower()
     if "running layerdiff" in low:
-        return "layerdiff", 0.05
+        return "layerdiff"
     if "running marigold" in low:
-        return "marigold", 0.60
+        return "marigold"
     if "psd saved" in low:
-        return "psd", 0.98
+        return "psd"
     return None
+
+
+def _count_outputs(out_dir: Path) -> tuple[int, int, float]:
+    """(layer PNGs, depth PNGs, newest mtime) written so far."""
+    layers = depths = 0
+    newest = 0.0
+    try:
+        entries = list(out_dir.iterdir())
+    except OSError:
+        return 0, 0, 0.0
+    for p in entries:
+        if p.suffix.lower() != ".png":
+            continue
+        try:
+            newest = max(newest, p.stat().st_mtime)
+        except OSError:
+            pass
+        name = p.name
+        if "_depth" in name:
+            depths += 1
+        elif not name.startswith("src_") and name != "reconstruction.png":
+            layers += 1
+    return layers, depths, newest
+
+
+def _watch_outputs(
+    out_dir: Path, phase: dict, stop: threading.Event, on_progress: ProgressFn
+) -> None:
+    """Report progress from files landing on disk.
+
+    Parsing tqdm does not work here. OCS passes ``--disable_progressbar``, so the
+    only percentages the subprocess prints come from the model *loader*, and a
+    regex looking for "n%" latches onto "Loading pipeline components 100%" and then
+    never changes -- the bar sat at a fixed number for fifteen minutes while the
+    job was in fact running fine, which is indistinguishable from a hang.
+
+    File counts are ground truth: ``apply_layerdiff`` writes one PNG per tag and
+    ``apply_marigold`` one ``_depth`` PNG per part. Reporting the newest write also
+    tells the UI when something last actually happened, which is the question a
+    stalled-looking bar really raises.
+    """
+    last: tuple[int, int] = (-1, -1)
+    while not stop.wait(2.0):
+        layers, depths, newest = _count_outputs(out_dir)
+        current = phase.get("name", "starting")
+        if (layers, depths) == last and current != "starting":
+            # No new file, but say so with the timestamp rather than going silent.
+            idle = time.time() - newest if newest else 0.0
+            if idle > 20:
+                on_progress(f"{current} {_fmt(layers, depths, current)} "
+                            f"(last write {int(idle)}s ago)", None)
+            continue
+        last = (layers, depths)
+        base, span = _PHASE_SPAN.get(current, (0.02, 0.0))
+        done, total = ((layers, LAYERDIFF_OUTPUTS) if current == "layerdiff"
+                       else (depths, MARIGOLD_OUTPUTS))
+        frac = min(1.0, done / total) if total else 0.0
+        on_progress(f"{current} {_fmt(layers, depths, current)}",
+                    min(0.97, base + span * frac))
+
+
+def _fmt(layers: int, depths: int, phase: str) -> str:
+    if phase == "layerdiff":
+        return f"{layers}/{LAYERDIFF_OUTPUTS} layers"
+    if phase == "marigold":
+        return f"{depths}/{MARIGOLD_OUTPUTS} depth maps"
+    return ""
 
 
 def run_inference(
@@ -94,33 +166,43 @@ def run_inference(
     if on_progress:
         on_progress("starting see-through", 0.01)
 
+    # Where apply_layerdiff / apply_marigold write their per-tag PNGs.
+    out_dir = save_dir / image_path.stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     log = open(log_path, "w", encoding="utf-8") if log_path else None
+    phase: dict[str, str] = {"name": "starting"}
+    stop = threading.Event()
+    watcher: threading.Thread | None = None
+    if on_progress:
+        watcher = threading.Thread(
+            target=_watch_outputs, args=(out_dir, phase, stop, on_progress), daemon=True
+        )
+        watcher.start()
+
     try:
         proc = subprocess.Popen(
             cmd, cwd=str(SEE_THROUGH_DIR), env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
         )
-        phase, base = "starting", 0.01
+        # stdout is read only for the phase markers -- plain prints from
+        # inference_psd.py. The fraction comes from the watcher above.
         for line in _stream(proc):
             if log:
                 log.write(line + "\n")
                 log.flush()
             found = _phase_of(line)
             if found:
-                phase, base = found
+                phase["name"] = found
                 if on_progress:
-                    on_progress(phase, base)
-                continue
-            if on_progress:
-                m = _PCT.search(line) or _STEP.search(line)
-                if m:
-                    frac = (int(m.group(1)) / 100.0 if "%" in m.group(0)
-                            else int(m.group(1)) / max(1, int(m.group(2))))
-                    span = 0.55 if phase == "layerdiff" else 0.35
-                    on_progress(phase, min(0.97, base + span * frac))
+                    base, _span = _PHASE_SPAN.get(found, (0.98, 0.0))
+                    on_progress(found, base)
         code = proc.wait()
     finally:
+        stop.set()
+        if watcher:
+            watcher.join(timeout=3)
         if log:
             log.close()
 
