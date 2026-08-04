@@ -663,7 +663,19 @@ def restore_source_pixels(
         )
         solid = alpha >= floor
         visible = solid & ~claimed[cy1:cy2, cx1:cx2]
-        claimed[cy1:cy2, cx1:cx2] |= alpha > 8
+        # Claim a pixel only where this part actually hides what is behind it.
+        #
+        # This used to be ``alpha > 8``, which let a part's *feathered edge* --
+        # alpha 9 is enough -- block the repaint of the part behind it, even
+        # though at 3% opacity the front part contributes almost nothing there and
+        # the back part is what you see. The back part then kept see-through's
+        # drifted colour, which is darker, along every front part's outline.
+        #
+        # That is the dark hairline: measured over 7397 dark pixels, 4575 (61.8%)
+        # sat on the frontmost part's own edge, while only 293 (4.0%) sat on an
+        # edge behind. It is colour, not coverage -- alpha reconstruction is within
+        # 0.95 of the source on all but 232 px of 72918.
+        claimed[cy1:cy2, cx1:cx2] |= alpha >= s.source_pixel_claim_floor
 
         if not visible.any():
             continue

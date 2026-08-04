@@ -148,6 +148,12 @@ class RigSettings:
     #: puts dark hairlines along every interior cut. See
     #: ``rig.restore_source_pixels`` for the measurements.
     source_pixel_alpha_floor_interior: int = 64
+    #: How opaque a nearer part must be before it stops the part behind it being
+    #: repainted from the source. Near-255 on purpose: a feathered edge at alpha 9
+    #: hides nothing, so letting it claim the pixel leaves the *visible* part
+    #: behind it holding see-through's drifted colour -- a dark line along every
+    #: outline. See ``rig.restore_source_pixels``.
+    source_pixel_claim_floor: int = 250
 
 
 @dataclass
