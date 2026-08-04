@@ -177,14 +177,27 @@ def test_resolution_under_the_cap_is_left_alone():
 def test_cap_rewrites_argv_and_says_so(capsys):
     from scripts.run_seethrough import _cap_resolution_args
 
+    cap = torch_device.MPS_MAX_RESOLUTION
     argv = ["x.py", "--srcp", "a.png", "--resolution", "1280",
-            "--resolution_depth", "768", "--seed", "42"]
+            "--resolution_depth", "768", "--seed", str(cap)]
     _cap_resolution_args(argv, torch.device("mps"))
-    assert argv[argv.index("--resolution") + 1] == str(torch_device.MPS_MAX_RESOLUTION)
-    # 768 is already at the cap, so it stays and draws no note.
-    assert argv[argv.index("--resolution_depth") + 1] == "768"
-    assert "--seed" in argv and argv[argv.index("--seed") + 1] == "42"
+    # Both resolutions are capped; the depth pass is no cheaper than the main one.
+    assert argv[argv.index("--resolution") + 1] == str(cap)
+    assert argv[argv.index("--resolution_depth") + 1] == str(cap)
+    # Only the two resolution flags are touched, whatever their values.
+    assert argv[argv.index("--seed") + 1] == str(cap)
+    assert argv[1] == "--srcp" and argv[2] == "a.png"
     assert "[ocs] --resolution" in capsys.readouterr().out
+
+
+def test_a_resolution_already_at_the_cap_is_not_renoted(capsys):
+    from scripts.run_seethrough import _cap_resolution_args
+
+    cap = torch_device.MPS_MAX_RESOLUTION
+    argv = ["x.py", "--resolution", str(cap)]
+    _cap_resolution_args(argv, torch.device("mps"))
+    assert argv[2] == str(cap)
+    assert capsys.readouterr().out == ""
 
 
 def test_cap_tolerates_a_missing_or_unparseable_value(capsys):

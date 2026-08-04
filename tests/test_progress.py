@@ -54,9 +54,12 @@ def test_two_layerdiff_passes_do_not_reset_the_bar():
         + _denoise(20, 20)
         + ["psd saved"]
     )
-    values = [frac for _, frac in drive(lines)]
+    events = drive(lines)
+    values = [frac for _, frac in events]
     assert values, "no progress was reported at all"
-    assert all(b >= a for a, b in zip(values, values[1:])), "bar went backwards"
+    dips = [(i, events[i], events[i + 1])
+            for i in range(len(values) - 1) if values[i + 1] < values[i] - 1e-9]
+    assert not dips, f"bar went backwards at {dips[:4]}"
 
 
 def test_unrelated_tqdm_bars_cannot_drag_it_backwards():
@@ -68,8 +71,11 @@ def test_unrelated_tqdm_bars_cannot_drag_it_backwards():
         + ["Loading pipeline components...: 100%|####| 5/5 [00:01<00:00, 4.01it/s]"]
         + _denoise(30)
     )
-    values = [frac for _, frac in drive(lines)]
-    assert all(b >= a for a, b in zip(values, values[1:]))
+    events = drive(lines)
+    values = [frac for _, frac in events]
+    dips = [(i, events[i], events[i + 1])
+            for i in range(len(values) - 1) if values[i + 1] < values[i] - 1e-9]
+    assert not dips, f"bar went backwards at {dips[:4]}"
 
 
 def test_phase_changes_are_reported_and_ordered():

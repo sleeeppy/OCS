@@ -131,8 +131,8 @@ def should_group_offload(device: "object", requested: bool) -> bool:
 #:
 #: The binding constraint is not the weights, it is one self-attention call.
 #: MPS has no memory-efficient SDPA kernel: it materialises the score matrix, so
-#: cost grows with the square of the token count. Measured directly, bf16, 10
-#: heads, ``driver_allocated_memory`` after a single
+#: cost grows with the square of the token count. Measured directly, bf16, one
+#: sequence, ten heads, ``driver_allocated_memory`` after a single
 #: ``scaled_dot_product_attention``:
 #:
 #:     resolution   latent tokens   allocated
@@ -140,15 +140,36 @@ def should_group_offload(device: "object", requested: bool) -> bool:
 #:           1024          16,384     12.6 GB
 #:           1280          25,600     25.4 GB
 #:
-#: ``torch.mps.recommended_max_memory()`` is 17.8 GB on a 24 GB machine, so 1280
-#: blows the budget on attention alone -- before any of the ~8 GB of SDXL weights.
-#: It does not fail cleanly either: macOS swaps instead, and the run sits at step
-#: 0/30 with the GPU busy and 12 GB of swap in use.
+#: That measurement is what set this to 768 at first, and it was too generous,
+#: because it only sized *one* sequence. ``apply_layerdiff`` runs the schedule
+#: twice for tag v3, and the second pass -- a crop around the head, generating
+#: eleven tags -- attends with an effective batch of about ten. A real run failed
+#: an hour in with
+#:
+#:     RuntimeError: Invalid buffer size: 15.82 GiB
+#:
+#: and 15.82 GiB is exactly ``100 x 9216^2 x 2`` bytes: ten sequences x ten heads
+#: at 768's token count. So the per-call cost is roughly
+#:
+#:     bytes ~= batch * heads * (res/8)^4 * 2
+#:
+#: and against the ~10.8 GB ceiling ``configure_mps_env`` sets, that gives
+#:
+#:     resolution   tokens   one attention call
+#:            768    9,216            15.8 GiB   <- fails
+#:            640    6,400             7.6 GiB
+#:            512    4,096             3.1 GiB
+#:
+#: Hence 640: the largest that leaves the head pass inside the budget. The failure
+#: mode is worth noting -- it is a clean exception, but it arrives *after* the body
+#: pass has finished, so the cost of getting this wrong is the whole run. What
+#: makes that survivable is ``psd_io.read_layer_dir``: every layer both passes
+#: produced is already on disk, so the hour is recoverable.
 #:
 #: Group offloading cannot help here. It pages *parameters*, and this is
 #: activations -- LayerDiff 3D generates the layers as frames in one batch, so
 #: they scale together.
-MPS_MAX_RESOLUTION = 768
+MPS_MAX_RESOLUTION = 640
 
 
 def cap_resolution(resolution: int, device: "object") -> tuple[int, str | None]:

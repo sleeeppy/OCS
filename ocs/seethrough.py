@@ -39,6 +39,17 @@ ProgressFn = Callable[[str, float | None], None]
 _PCT = re.compile(r"(\d{1,3})%\|")
 _STEP = re.compile(r"(\d+)/(\d+)")
 
+#: Largest ``n/N`` total that can plausibly be an inference-step counter.
+#:
+#: ``_STEP`` matches any progress bar, and the loaders dominate the log: on one
+#: real run, 1038 lines of ``.../517`` (weight tensors) and 394 of ``.../196``
+#: against 55 of ``.../30`` (the actual denoise). A ``517/517`` reads as 100% done,
+#: and combined with the monotonic clamp below that pinned the bar high and
+#: suppressed every genuine step afterwards -- the UI froze at 29% while the run
+#: was 85% through layerdiff. Ignoring implausible totals is what keeps the clamp
+#: from being poisoned by a loader.
+_MAX_STEP_TOTAL = 200
+
 #: How many denoise loops ``apply_layerdiff`` runs, per pass, for tag v3.
 #:
 #: Two, not one. The first covers the body tag list; the second re-runs the whole
@@ -190,16 +201,22 @@ def run_inference(
                     on_progress(phase, base)
                 continue
             if on_progress:
-                m = _PCT.search(line) or _STEP.search(line)
+                m = _STEP.search(line)
+                frac = None
                 if m:
-                    if "%" in m.group(0):
-                        frac = int(m.group(1)) / 100.0
-                    else:
-                        step, total = int(m.group(1)), max(1, int(m.group(2)))
+                    step, total = int(m.group(1)), max(1, int(m.group(2)))
+                    if total <= _MAX_STEP_TOTAL:
                         if step < last_step:
                             loop += 1
                         last_step = step
                         frac = step / total
+                if frac is None:
+                    # Fall back to the percentage, but only when no step counter
+                    # was present -- a loader's "100%|" would poison the clamp
+                    # exactly like its "517/517" does.
+                    if m is None and (pm := _PCT.search(line)):
+                        frac = int(pm.group(1)) / 100.0
+                if frac is not None:
                     passes = _LAYERDIFF_PASSES if phase == "layerdiff" else 1
                     frac = min(1.0, (min(loop, passes - 1) + frac) / passes)
                     span = 0.55 if phase == "layerdiff" else 0.35
