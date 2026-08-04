@@ -229,6 +229,90 @@ def read_decomposition(psd_path: str | Path, load_depth: bool = True) -> Decompo
     return Decomposition(canvas=canvas, parts=parts, src_img=src_img, psd_path=psd_path)
 
 
+def read_layer_dir(layer_dir: str | Path) -> Decomposition:
+    """Load see-through's per-tag PNG directory, without needing the PSD.
+
+    Recovery path, and not a marginal one. ``apply_layerdiff`` writes each tag's
+    PNG as it goes, but the PSD is only assembled at the very end by
+    ``further_extr``. On a machine where one image takes an hour, anything that
+    interrupts the run after the body pass throws away every layer it already
+    produced -- 30 minutes of GPU work sitting on disk that ``read_decomposition``
+    cannot open because the container was never written.
+
+    Two things are missing compared with the PSD path, neither fatal:
+
+    - No ``depth_median``, because that comes from the depth pass. Every part gets
+      1.0, which makes every pair a tie, which hands ordering entirely to
+      ``taxonomy.Z_PRIOR`` -- a full tag-to-order table that exists precisely
+      because the depth estimate is unreliable for thin overlapping parts.
+    - No per-part depth maps. Nothing downstream requires them.
+
+    ``src_img.png`` and ``src_head.png`` are see-through's own inputs, not output
+    layers, so they are read as the source image rather than treated as parts.
+    """
+    layer_dir = Path(layer_dir)
+    if not layer_dir.is_dir():
+        raise FileNotFoundError(f"not a directory: {layer_dir}")
+
+    src_img = None
+    src_p = layer_dir / "src_img.png"
+    if src_p.exists():
+        src_img = np.array(Image.open(src_p).convert("RGBA"))
+
+    #: see-through's inputs, which live in the same directory as its outputs.
+    inputs = {"src_img", "src_head"}
+    files = sorted(p for p in layer_dir.glob("*.png") if p.stem not in inputs)
+    if not files:
+        raise FileNotFoundError(f"no layer PNGs in {layer_dir}")
+
+    canvas = None
+    if src_img is not None:
+        canvas = (src_img.shape[1], src_img.shape[0])
+
+    parts: list[Part] = []
+    for index, path in enumerate(files):
+        full = np.array(Image.open(path).convert("RGBA"))
+        if canvas is None:
+            canvas = (full.shape[1], full.shape[0])
+
+        # Crop to the alpha box, exactly as psd-tools resolves each PSD layer to
+        # its own box plus an offset. Not cosmetic: cleanup's alpha_mean is the
+        # mean over the *part*, so a full-canvas image makes any small real layer
+        # look near-transparent. Measured here, uncropped, the character's `neck`
+        # -- 1173 fully opaque pixels -- scored alpha_mean 0.0018 against a
+        # 0.01 auto-drop floor and was deleted without asking. `footwear` came out
+        # at 0.0100, right on the line. Cropping also stops every layer's bbox
+        # spanning the canvas, which had `front hair`, `head` and `tail` all
+        # flagged `contained_in_other`.
+        rgba, offset = _crop_to_alpha(full)
+        parts.append(Part(
+            name=path.stem,
+            rgba=rgba,
+            offset=offset,
+            depth_median=1.0,
+            meta={"psd_index": index, "from_layer_dir": True},
+        ))
+
+    return Decomposition(canvas=canvas, parts=parts, src_img=src_img)
+
+
+def _crop_to_alpha(
+    rgba: np.ndarray, alpha_floor: int = 8
+) -> tuple[np.ndarray, tuple[int, int]]:
+    """Trim to the opaque bounding box, returning the crop and its offset.
+
+    A layer with no opaque pixels keeps a 1x1 placeholder at the origin rather
+    than an empty array, so cleanup can report it as the dummy it is instead of
+    tripping over a zero-sized shape.
+    """
+    ys, xs = np.nonzero(rgba[..., 3] > alpha_floor)
+    if len(xs) == 0:
+        return np.zeros((1, 1, 4), np.uint8), (0, 0)
+    x1, x2 = int(xs.min()), int(xs.max()) + 1
+    y1, y2 = int(ys.min()), int(ys.max()) + 1
+    return rgba[y1:y2, x1:x2].copy(), (x1, y1)
+
+
 def write_parts_png(parts: list[Part], out_dir: str | Path) -> dict[str, Path]:
     """Dump each part as a trimmed PNG plus an offsets manifest, for the atlas."""
     out_dir = Path(out_dir)

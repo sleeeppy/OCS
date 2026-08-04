@@ -118,6 +118,14 @@ class RigSettings:
     #: Overlap grown onto each partition region so neighbouring parts share a
     #: seam instead of showing a gap when the joint bends.
     seam_allowance_px: int = 8
+    #: How far outside its alpha each mesh outline is traced, in pixels.
+    #:
+    #: One pixel covers the antialiased rim. Two is for the seams: ``_triangulate``
+    #: drops boundary triangles, costing every part 0.6-4.6% of its alpha at its
+    #: own edge, and where two slices of one garment meet both losses land in the
+    #: same place. Overshooting costs nothing -- the extra band is transparent in
+    #: the texture, so it renders as nothing until a neighbour's loss exposes it.
+    outline_dilate_px: int = 2
     #: A partition slice smaller than this fraction of the source layer is
     #: discarded rather than emitted as a sliver attachment.
     min_slice_fraction: float = 0.02
@@ -130,10 +138,16 @@ class RigSettings:
     #: Where a part is frontmost, the original already holds its exact pixels.
     #: Upstream does this itself for nose and mouth in ``further_extr``.
     restore_source_pixels: bool = True
-    #: Only repaint pixels this opaque. Partly transparent edge pixels in the
-    #: source are a blend with whatever is behind, so copying them there would
-    #: pull the neighbour's colour into the seam.
+    #: Only repaint pixels this opaque, **at the character's outer rim**. A partly
+    #: transparent pixel there is a blend with the background, so copying it in
+    #: would drag background colour into the outline.
     source_pixel_alpha_floor: int = 200
+    #: The same floor away from the outer rim, where a partly transparent pixel is
+    #: a blend with another part of the character rather than the background --
+    #: which is the colour the seam should have. Leaving these un-repainted is what
+    #: puts dark hairlines along every interior cut. See
+    #: ``rig.restore_source_pixels`` for the measurements.
+    source_pixel_alpha_floor_interior: int = 64
 
 
 @dataclass

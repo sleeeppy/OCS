@@ -308,6 +308,11 @@ def load_decomposition(project: Project) -> psd_io.Decomposition:
     if stored:
         return psd_io.read_decomposition(project.root / stored)
 
+    # A run interrupted before further_extr has the layer PNGs but no PSD.
+    layer_dir = project.state.get("layer_dir")
+    if layer_dir:
+        return psd_io.read_layer_dir(project.root / layer_dir)
+
     figure = project.state.get("demo")
     if figure:
         from . import demo

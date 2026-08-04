@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
+import scipy.ndimage as ndi
 
 from . import taxonomy
 from .config import RigSettings
@@ -418,12 +419,21 @@ def _mesh_attachment(
     if not mask.any():
         return None
 
-    # Trace one pixel outside the alpha. A polygon through the alpha boundary
-    # clips the feathered antialiased rim, and losing a 1 px outline all the way
-    # round a large part is most of its total ink loss (front hair: 1372 px).
+    # Trace outside the alpha. A polygon through the alpha boundary clips the
+    # feathered antialiased rim, and losing a 1 px outline all the way round a
+    # large part is most of its total ink loss (front hair: 1372 px).
     # Overshooting is free -- the extra band is transparent in the texture.
+    #
+    # One pixel is not enough where two slices of the same garment meet, though.
+    # _triangulate drops boundary triangles (centre outside the mask, or needle
+    # shaped), which costs each part 0.6-4.6% of its own alpha right at its edge
+    # -- measured per part, worst topwear@arm_r_upper at 2.31%. Both sides of a
+    # cut lose their edge, so the losses add and the seam shows. Dilating further
+    # makes each mesh reach past its neighbour's loss instead.
+    radius = max(1, int(s.outline_dilate_px))
     outline_mask = cv2.dilate(
-        mask.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask.astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1,) * 2),
     ) > 0
 
     outline, n_hull = _contour_points(outline_mask, s.contour_epsilon, s.contour_epsilon_max_px)
@@ -607,6 +617,32 @@ def restore_source_pixels(
     claimed = np.zeros((ch, cw), dtype=bool)
     out: list[Part] = list(ordered)
 
+    # Two thresholds, because the reason for a high one only holds in one place.
+    #
+    # A partly transparent pixel in the source is a blend with whatever is behind
+    # it. At the character's outer edge that is the *background*, so copying it in
+    # drags background colour into the rim. Everywhere else it is another part of
+    # the character, which is the colour we want.
+    #
+    # Using one high floor for both leaves every interior seam un-repainted, and
+    # those un-repainted feathered edges are the dark hairlines that read as
+    # "visible cuts". Measured on this character, sweeping a single global floor:
+    #
+    #   floor   outer-rim px / mean    interior px / mean
+    #     200        815 / -22.7          4963 / -19.0
+    #      64        796 / -25.3          4119 / -17.3
+    #
+    # -- the interior improves and the rim gets worse, exactly as the original
+    # comment predicted. Splitting the threshold takes the interior win without
+    # paying for it at the rim.
+    silhouette = np.zeros((ch, cw), dtype=bool)
+    for part in ordered:
+        silhouette |= part.canvas_mask(decomp.canvas)
+    rim = silhouette & ~ndi.binary_erosion(
+        silhouette, ndi.generate_binary_structure(2, 2), iterations=2
+    )
+    rim = ndi.binary_dilation(rim, iterations=1)
+
     # Near to far: the last-drawn part is the one you actually see.
     for i in range(len(ordered) - 1, -1, -1):
         part = ordered[i]
@@ -620,7 +656,12 @@ def restore_source_pixels(
         h, w = cy2 - cy1, cx2 - cx1
         alpha = part.alpha[sy:sy + h, sx:sx + w]
 
-        solid = alpha >= s.source_pixel_alpha_floor
+        floor = np.where(
+            rim[cy1:cy2, cx1:cx2],
+            s.source_pixel_alpha_floor,
+            s.source_pixel_alpha_floor_interior,
+        )
+        solid = alpha >= floor
         visible = solid & ~claimed[cy1:cy2, cx1:cx2]
         claimed[cy1:cy2, cx1:cx2] |= alpha > 8
 
