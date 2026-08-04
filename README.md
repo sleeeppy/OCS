@@ -76,14 +76,18 @@ Two findings that only showed up by running it:
 
 ## Requirements
 
-- Windows (paths and helper scripts are PowerShell; the Python is portable)
-- An NVIDIA GPU. 16 GB is comfortable; 8 GB works with the low-VRAM paths.
 - [uv](https://github.com/astral-sh/uv), Python 3.12, git
-- ~20 GB free for model weights
+- For the layer-decomposition stage: an NVIDIA GPU **or** Apple Silicon.
+  ~20 GB free for model weights.
 
-Verified on: Windows 11, RTX 5070 Ti (16 GB, sm_120), CUDA 12.8, Python 3.12.13,
-torch 2.8.0+cu128. Blackwell cards need cu128 wheels — earlier builds have no
-sm_120 kernels.
+| | |
+|---|---|
+| **NVIDIA** | 16 GB is comfortable; 8 GB works with the low-VRAM paths. Verified on Windows 11, RTX 5070 Ti (16 GB, sm_120), CUDA 12.8, torch 2.8.0+cu128. Blackwell cards need cu128 wheels — earlier builds have no sm_120 kernels. |
+| **Apple Silicon** | Verified on macOS 15 / M5 Pro, 24 GB unified, torch 2.8.0 MPS. Slower than a discrete card. See [Apple Silicon](#apple-silicon). |
+| **Neither** | Everything except decomposition still runs. See [Without a GPU](#without-a-gpu). |
+
+Helper scripts come in both flavours: `.ps1` for Windows, `.sh` for macOS and
+Linux. The Python is portable either way.
 
 ## Setup
 
@@ -92,6 +96,18 @@ git clone --recurse-submodules https://github.com/sleeeppy/OCS.git
 cd OCS
 ./scripts/setup_env.ps1
 ```
+
+macOS / Linux:
+
+```bash
+./scripts/setup_env.sh              # OCS only, no GPU stage — under a minute
+./scripts/setup_env.sh --with-gpu   # + torch and see-through's requirements
+```
+
+The two setup scripts differ in one deliberate way. `setup_env.ps1` exits
+non-zero when `torch.cuda.is_available()` is false, because on Windows that means
+a broken install. `setup_env.sh` only reports it: the GPU is needed for exactly
+one stage, and failing there would block a stack that is otherwise fully usable.
 
 One virtualenv holds both OCS and see-through. see-through's `requirements.txt`
 already pins the heavy half of what OCS needs (numpy, opencv, pillow, scipy,
@@ -111,7 +127,11 @@ from unpkg instead.
 ## Run
 
 ```powershell
-./scripts/run_ocs.ps1
+./scripts/run_ocs.ps1     # Windows
+```
+
+```bash
+./scripts/run_ocs.sh      # macOS / Linux
 ```
 
 Then open <http://127.0.0.1:8765/>. Drop in an illustration and work through the
@@ -129,7 +149,8 @@ minutes per image.
 
 1. **Upload** — resolution, steps and seed are under *고급 설정*. `group offload`
    is on by default: the plain path peaks at 12–16 GB at 1280, right at the edge
-   of a 16 GB card, while offload brings it to ~10 GB.
+   of a 16 GB card, while offload brings it to ~10 GB. Leave it on for MPS —
+   without it a 1280 run swaps.
 2. **Layer cleanup** — thumbnails with the reason each layer was dropped or
    flagged. Untick to exclude; auto-dropped layers can be brought back.
 3. **Bone placement** — drag the joints. `Shift`+drag moves the subtree, `X`
@@ -170,19 +191,156 @@ by hand in the editor.
 see-through's own convention in `label_lr_split`, where the lower-centroid-x
 component is tagged `-r`. Getting it backwards mirrors every animation.
 
-## Without a GPU run
+## Apple Silicon
 
-Already have see-through output, or want to iterate on cleanup, partitioning or
-rigging without paying for inference each time:
+see-through targets CUDA and says so in eight places, all in
+`common/utils/inference_utils.py` — five `.to(device='cuda')` calls on the
+layerdiff sub-modules, `marigold_pipeline.to(device='cuda')`, and two
+`enable_group_offload('cuda', …)`. Everything downstream reads the device back
+off the modules (`self.unet.device`, `vae.device`), so those eight sites are the
+whole story: move the modules and the rest follows.
 
-```powershell
-.venv/Scripts/python.exe scripts/import_psd.py workspace/seethrough/foo.psd
-.venv/Scripts/python.exe scripts/render_debug.py
+[`ocs/torch_device.py`](ocs/torch_device.py) redirects them at runtime instead of
+patching the submodule, which `git submodule update` would revert. The rewrite is
+narrow — a *requested* CUDA device becomes the real one and nothing else changes,
+so `.to('cpu')` still means CPU and a dtype-only `.to()` is untouched.
+[`scripts/run_seethrough.py`](scripts/run_seethrough.py) applies it and then hands
+off to see-through's own script through `runpy`, argv untouched.
+
+Setup is the same command with one flag:
+
+```bash
+./scripts/setup_env.sh --with-gpu
+```
+
+What was measured on an M5 Pro / 24 GB, torch 2.8.0:
+
+- bf16 matmul, `conv2d`, `group_norm` and `scaled_dot_product_attention` all work,
+  and `torch.Generator(device='mps')` seeds `randn` reproducibly — the dtype
+  see-through asks for needs no downgrade.
+- `torch.cuda.empty_cache()` and `torch.cuda.manual_seed_all()`, which see-through
+  calls unguarded, are already no-ops when CUDA is absent — left alone.
+- `PYTORCH_ENABLE_MPS_FALLBACK=1` is set, so a missing MPS kernel drops to CPU
+  instead of ending the run.
+
+### Resolution is capped at 768 on MPS
+
+This is the one place Apple Silicon does not just work, and it is not about the
+weights. **MPS has no memory-efficient SDPA kernel** — it materialises the
+attention score matrix, so cost grows with the square of the token count.
+Measured directly, bf16, 10 heads, `driver_allocated_memory` after a *single*
+`scaled_dot_product_attention`:
+
+| `--resolution` | latent tokens | allocated by one attention call |
+|---|---|---|
+| 768 | 9,216 | 4.2 GB |
+| 1024 | 16,384 | 12.6 GB |
+| 1280 | 25,600 | **25.4 GB** |
+
+`torch.mps.recommended_max_memory()` is 17.8 GB here, so see-through's default
+1280 exceeds the budget on attention alone — before any of the ~8 GB of SDXL
+weights. And it does not fail cleanly: macOS swaps instead, so the run sits at
+step 0/30 with the GPU busy and 12 GB of swap in use, looking like a hang.
+
+`scripts/run_seethrough.py` therefore clamps `--resolution` to
+`torch_device.MPS_MAX_RESOLUTION` and prints the override rather than silently
+producing a smaller decomposition than asked for. Raise the constant if a future
+torch ships a flash-attention path for MPS.
+
+**Group offloading cannot fix that** — it pages *parameters*, and this is
+activations. Keep it on anyway: it is what brought the peak footprint from 35 GB
+down to 17 GB. diffusers' implementation does work on MPS (verified end to end on
+a real `UNet2DConditionModel`, finite bf16 output) on one condition, which
+`redirect_cuda_to` enforces: `use_stream` must stay `False`. The streamed path
+builds a pinned-memory dict, and `Tensor.pin_memory()` fails on this machine
+(*"Attempted to set the storage of a tensor on device cpu to a storage on
+different device mps:0"*). see-through never passes `use_stream`, so the default
+already avoids it; the wrapper pins it off regardless.
+
+### The allocator ceiling matters more than anything else here
+
+`PYTORCH_MPS_HIGH_WATERMARK_RATIO` defaults to **1.7**, relative to
+`recommended_max_memory()`. On this machine that authorises a **30.2 GB**
+allocator on **24 GB** of RAM, and the driver uses it: measured at 30.9 GB
+allocated with the system 25.7 GB into swap. The process `phys_footprint` stayed
+at a healthy 13 GB the whole time, which is why the obvious diagnostic says
+nothing is wrong — the growth is in the driver's cache, not the process heap.
+
+It presents as step time climbing without bound while the GPU stays busy:
+
+| step | s/it |
+|---|---|
+| 1–2 | 22 |
+| 20 | 153 |
+| 21 | 356 |
+| 23 | 427 (51 min in, never reached 30) |
+
+`configure_mps_env` derives the ceiling from physical RAM instead. The budget is
+under half, and that is deliberate: **on unified memory the MPS allocator and
+"CPU" memory are the same 24 GB**, so group offloading does not lower total
+demand — it moves the ~8 GB of weights into CPU-resident copies that still occupy
+RAM. Sizing the allocator as if it were the only consumer produced a 14.9 GB
+ceiling that still collapsed (14.9 + 8 + OS > 24), which is why steps 1–20 looked
+fine and step 21 fell over every time. It now lands at ~10.8 GB, for ~18.8 GB
+total.
+
+Expect roughly **15–20 s/it at 768**, so ~8–12 minutes of denoise per image, plus
+the depth pass. A discrete card does the same work in about two minutes. The cost
+is not really MPS being slow — LayerDiff **3D** generates all the layers as frames
+in one batch, so a step is an SDXL step at batch ~23. Halve `inference_steps` if
+you want it faster.
+
+`OCS_TORCH_DEVICE=cpu` forces the device choice if a driver bug shows up mid-run.
+
+## Without a GPU
+
+Decomposition is the only stage that needs one. Cleanup, silhouette, bone
+placement, limb partition, meshing, weighting, atlas packing, Spine export and
+the preview are numpy/opencv/scipy and run anywhere — so on a machine with no
+NVIDIA card the editor still works end to end, it just needs its layers from
+somewhere else.
+
+Already have see-through output, or want to iterate on the later stages without
+paying for inference each time:
+
+```bash
+.venv/bin/python scripts/import_psd.py workspace/seethrough/foo.psd
+```
+
+No GPU anywhere and no PSD to import — there is nothing for the editor to open
+past the upload step. Build a project from a synthetic decomposition instead:
+
+```bash
+.venv/bin/python scripts/make_demo_project.py --all
+```
+
+The layouts in `ocs/demo.py` are measured from see-through's own sample, not
+idealised: `handwear` is a whole arm, `legwear` is both legs in one layer, there
+is no skin tag, and the empty/duplicate/speck layers are present. `--figure blob`
+is the interesting one — a single connected silhouette in a single layer with
+arms fused to the torso and no left/right suffixes anywhere, so only the bone
+skeleton can separate the sides. `tests/conftest.py` wraps the same builders.
+
+```bash
+.venv/bin/python scripts/render_debug.py --project <id>
 ```
 
 `render_debug.py` writes a sheet showing the source, the silhouette, the bones and
 the bone partition — handy for judging a rig at a glance or filing a bug that
-shows what OCS actually decided.
+shows what OCS actually decided. For a project it draws the rig in effect,
+including your edits.
+
+### Known limitation
+
+`skeleton.guess_rig`'s geodesic fallback misplaces the leg chain on the `blob`
+figure: it reads the fused torso block's lower corners as extremities and puts
+`{side}Knee` and `{side}Foot` at the bottom of the torso instead of down the
+legs, leaving the legs unclaimed by any joint. The partition still verifies 4:4
+because `Rig.segment` extrapolates open chain ends far enough to sweep them — so
+`verify_limb_separation` passing is not on its own evidence that the joints are
+where they belong. Drag them in step 3, or start from a decomposition that has
+per-limb layers. Only the single-blob input is affected; a real see-through PSD
+places these from layers (`source: "layer"`), which is correct.
 
 ## Layout
 
@@ -190,6 +348,8 @@ shows what OCS actually decided.
 ocs/
   taxonomy.py     see-through's 23 tags, the bone template, tag→region/bone rules
   seethrough.py   subprocess driver for the submodule
+  torch_device.py accelerator choice + the cuda→mps redirection
+  demo.py         synthetic decompositions for the no-GPU path and the tests
   psd_io.py       PSD + sidecars → Part objects
   silhouette.py   character outline (harder than it sounds — see the module docstring)
   cleanup.py      requirement 2: dummy-layer detection, two tiers
@@ -207,8 +367,9 @@ tests/            pytest; fixtures modelled on real see-through output
 
 ## Tests
 
-```powershell
-.venv/Scripts/python.exe -m pytest tests -q
+```bash
+.venv/bin/python -m pytest tests -q          # macOS / Linux
+.venv/Scripts/python.exe -m pytest tests -q  # Windows
 ```
 
 The interesting cases are the hard ones: a single connected silhouette in a single
