@@ -307,20 +307,26 @@ const App = (() => {
     const box = $("verify-body");
     box.className = "mono";
     box.innerHTML = "";
-    const ok = res.verify && res.verify.ok;
+    const verify = res.verify || {};
+    const ok = verify.ok;
+    const LIMB_KO = { "arm-left": "왼팔", "arm-right": "오른팔",
+                      "leg-left": "왼다리", "leg-right": "오른다리" };
     const head = document.createElement("div");
-    head.textContent = ok ? "좌·우 팔/다리 8개 영역 모두 분리됨 ✓"
-                          : `누락: ${(res.verify.missing_regions || []).join(", ")}`;
+    head.textContent = ok
+      ? "좌·우 팔/다리 모두 분리됨 ✓"
+      : `분리 안 됨: ${(verify.missing_limbs || []).map((m) => LIMB_KO[m] || m).join(", ")}`;
     head.style.color = ok ? "var(--ok)" : "var(--danger)";
     box.appendChild(head);
 
     const add = (t) => { const d = document.createElement("div"); d.textContent = t; box.appendChild(d); };
     add(`파츠 ${res.part_count}개`);
-    const sides = (res.verify && res.verify.parts_per_side) || {};
+    const sides = verify.parts_per_side || {};
     add(`좌 ${sides.left || 0} · 우 ${sides.right || 0}`);
+    // Slices only exist when RigSettings.slice_limb_spanning is on; by default
+    // limbs are left whole and bent by weights instead.
     const slices = (res.report && res.report.garment_slices) || {};
     for (const [src, pieces] of Object.entries(slices)) {
-      add(`${src} → ${pieces.length}`);
+      add(`${src} → ${pieces.length}조각`);
     }
     const forced = (res.report && res.report.forced) || [];
     for (const f of forced) {
