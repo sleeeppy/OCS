@@ -173,6 +173,16 @@ class RigSettings:
     #: internal boundary, so ``collar over sleeve`` composites to 0.75 where the
     #: artwork was 1.0 and the background shows through the difference. That is the
     #: dark hairline. See ``rig.restore_source_alpha``.
+    #: Extend every layer's opacity this far past its own edge, inside the artwork.
+    #:
+    #: The fix for visible cuts, and it is arithmetic: splitting one antialiased
+    #: image into layers halves the alpha at each internal boundary, so
+    #: ``collar over sleeve`` composites to 0.75 where the artwork was 1.0 and the
+    #: background shows through. Extending the layer *behind* restores both the
+    #: opacity and the original blend -- raising the front layer instead would show
+    #: its colour alone. Plateaus at 4 px; darkness drops 62%. See
+    #: ``rig.close_layer_seams``.
+    layer_extend_px: int = 4
     restore_source_alpha: bool = True
     #: How opaque the *artwork* must be before its alpha is treated as solid and
     #: copied back. High, so the character's own soft outline -- legitimately
