@@ -113,8 +113,22 @@ class RigSettings:
     #: Vertices closer than this to a bone are pinned fully to it.
     weight_pin_px: float = 4.0
     #: Overlap grown onto each partition region so neighbouring parts share a
-    #: seam instead of showing a gap when the joint bends.
+    #: seam instead of showing a gap when the joint bends. Only used when
+    #: ``slice_limb_spanning`` is on.
     seam_allowance_px: int = 8
+    #: Cut a limb-spanning layer into one attachment per bone region.
+    #:
+    #: Off by default, because it causes exactly the artifact it was meant to
+    #: avoid. A weighted mesh does not need cutting: the weights blend the motion
+    #: across a joint smoothly, which is how skirts and long hair are rigged in
+    #: practice. Cutting instead produces pieces that each follow one bone, so as
+    #: soon as anything moves the cut lines tear and ghost. Measured on one
+    #: character, the skirt was split into 7 pieces overlapping itself across
+    #: 31185 px, and the seams were plainly visible in motion.
+    #:
+    #: Left/right separation does not depend on this -- that is a real split into
+    #: separate layers (requirement 2-2), done before this step.
+    slice_limb_spanning: bool = False
     #: A partition slice smaller than this fraction of the source layer is
     #: discarded rather than emitted as a sliver attachment.
     min_slice_fraction: float = 0.02

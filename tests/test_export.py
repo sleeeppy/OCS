@@ -85,35 +85,51 @@ def test_vertex_weights_sum_to_one(figure):
         assert counted == len(att.uvs) // 2
 
 
-def test_limb_meshes_span_their_joint(figure):
-    """An upper arm weighted only to the shoulder cannot bend at the elbow.
+def test_uncut_limb_meshes_are_weighted_across_the_joint(figure):
+    """A whole arm must be weighted to both the shoulder and the elbow.
 
-    Only asserted for tags that actually reach past the joint. ``bottomwear`` is
-    restricted to the upper leg on purpose, so shorts must *not* be weighted to
-    the knee -- that restriction is the fix for weights leaking across limbs.
+    This is what replaced cutting at the joint: one mesh, weights spanning the
+    bend. If it were only weighted to the shoulder, the arm would swing rigidly
+    from it -- the very stiffness meshes exist to avoid.
     """
     built, _ = build(figure)
-    index = {b.name: i for i, b in enumerate(built.bones)}
+    names = [b.name for b in built.bones]
     checked = 0
     for slot in built.slots:
-        region = taxonomy.part_region(slot.part_name)
-        if region not in ("arm_r_upper", "arm_l_upper", "leg_r_upper", "leg_l_upper"):
+        tag = taxonomy.base_tag(slot.part_name)
+        side = taxonomy.part_side(slot.part_name)
+        if tag not in taxonomy.ARM_TAGS + taxonomy.LEG_TAGS or side is None:
             continue
         att = built.attachments[slot.attachment]
         if att.kind != "mesh":
             continue
-
-        tag = taxonomy.base_tag(slot.part_name)
-        lower = region.replace("_upper", "_lower")
-        allowed = taxonomy.allowed_regions(tag, taxonomy.part_side(slot.part_name))
-        if allowed is not None and lower not in allowed:
-            continue                      # this tag legitimately stops at the joint
-
-        child = next(s for s in taxonomy.SKIN_REGIONS if s.name == region).to_bone
-        if child in index:
-            assert index[child] in att.bones_used, f"{slot.name} is not weighted to {child}"
-            checked += 1
+        used = {names[i] for i in att.bones_used}
+        root_bone = f"{side}{'Arm' if tag in taxonomy.ARM_TAGS else 'Leg'}"
+        mid_bone = f"{side}{'Elbow' if tag in taxonomy.ARM_TAGS else 'Knee'}"
+        assert root_bone in used, f"{slot.name} not weighted to {root_bone} (has {used})"
+        assert mid_bone in used, f"{slot.name} not weighted to {mid_bone} (has {used})"
+        checked += 1
     assert checked, "no limb meshes were checked -- fixture or taxonomy changed"
+
+
+def test_torso_garments_reach_both_hips(figure):
+    """A skirt spans the trunk and both hips, so its weights must too.
+
+    Layers are no longer cut per region, so without this a skirt would ride a
+    single hip and swing off-centre.
+    """
+    built, _ = build(figure)
+    names = [b.name for b in built.bones]
+    for slot in built.slots:
+        if taxonomy.base_tag(slot.part_name) != "bottomwear":
+            continue
+        att = built.attachments[slot.attachment]
+        if att.kind != "mesh":
+            continue
+        used = {names[i] for i in att.bones_used}
+        assert {"leftLeg", "rightLeg"} <= used, f"{slot.name} only reaches {used}"
+        return
+    raise AssertionError("fixture has no bottomwear mesh")
 
 
 def test_weights_never_cross_between_arm_and_leg(figure):
@@ -318,7 +334,10 @@ def test_validate_rejects_a_short_translate_curve(figure):
     spine_export.add_animations(doc, built, ["idle"])
     assert spine_export.validate(doc) == []
 
-    doc["animations"]["idle"]["bones"]["torso"]["translate"][0]["curve"] = [0.1, 0, 0.3, 1]
+    # Any two-channel timeline will do; idle drives breath from the neck.
+    bones = doc["animations"]["idle"]["bones"]
+    target = next(b for b, tl in bones.items() if "translate" in tl)
+    bones[target]["translate"][0]["curve"] = [0.1, 0, 0.3, 1]
     problems = spine_export.validate(doc)
     assert any("needs 8" in p for p in problems), problems
 

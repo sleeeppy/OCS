@@ -55,6 +55,14 @@ every pixel goes to the bone segment it is nearest, the way a Blender bone envel
 works. That produces left and right limbs even for a single-blob silhouette, a
 symmetric pose, or arms crossing the torso — and it keeps every component.
 
+Separation is **per side, not per joint**. Cutting at the elbow and knee as well
+seemed reasonable and was wrong: each piece then follows one bone, so the moment
+anything moves the cut lines tear and ghost. On one character the skirt became
+seven pieces overlapping themselves across 31185 px, and the seams were plainly
+visible in motion. A weighted mesh does not need cutting — the weights blend the
+bend — so limbs and garments stay whole and are weighted across the joints they
+span. `RigSettings.slice_limb_spanning` still enables the old behaviour.
+
 **3. Region attachments cannot bend.** [`ocs/rig.py`](ocs/rig.py) builds
 triangulated **mesh attachments with bone weights** for every deformable part, so
 the elbow bends the pixels instead of pivoting a rigid quad. Small rigid features
@@ -148,7 +156,20 @@ workspace/projects/<id>/export/
   preview.html      standalone, everything inlined as data URIs
 ```
 
-Animations: `idle`, `walk`, `wave`, `jump`, `turn_head`.
+Animation: `idle` — a 3.6 s resting breath, and the only preset exported by
+default. It is the one animation that suits any pose; the others in
+`spine_export.PRESETS` (`walk`, `wave`, `jump`, `turn_head`) assume a standing
+figure, and a seated character swinging a leg through a floor-length skirt looks
+broken however well the mesh deforms. Pass `animations=[...]` to `export_skeleton`
+to get them.
+
+The idle avoids the three things that make an idle read as mechanical: everything
+keys on the same frames, the loop is short, and the whole body inflates together.
+So the chest leads and the head follows, the neck and head counter-rotate to keep
+the head level, hair trails wider and later — and `torso` is never moved at all,
+because it is the root of the body and translating it lifts a skirt off the floor
+with it (measured: 3 px of chest rise moved the bottom edge of a seated figure by
+3 px).
 
 ## Bone layout
 

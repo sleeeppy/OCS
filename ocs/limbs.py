@@ -433,22 +433,35 @@ def partition(
             pieces = split_lr(part, decomp, rig, grid, s.min_slice_fraction)
             if len(pieces) > 1:
                 report["lr_split"].append(part.name)
-                # A trouser leg still spans hip and knee; keep cutting it.
                 for piece in pieces:
-                    result.extend(_slice_by_regions(piece, decomp, grid, s, report))
+                    result.extend(_maybe_slice(piece, decomp, grid, s, report))
                 continue
             result.append(part)
             continue
 
         if tag in taxonomy.LIMB_SPANNING_TAGS:
-            result.extend(_slice_by_regions(part, decomp, grid, s, report))
+            result.extend(_maybe_slice(part, decomp, grid, s, report))
             continue
 
         result.append(part)
 
     # --- 3. guarantee ------------------------------------------------------
-    result = enforce_limb_coverage(result, decomp, grid, s, report)
+    # Requirement 2-2 is not negotiable, but cutting is a last resort now, so it
+    # only happens when nothing else produced a left and a right of each limb --
+    # e.g. art that arrives as a single blob, where geometry is the only way to
+    # tell the sides apart.
+    if s.slice_limb_spanning or not verify_limb_separation(result)["ok"]:
+        result = enforce_limb_coverage(result, decomp, grid, s, report)
     return result, report
+
+
+def _maybe_slice(
+    part: Part, decomp: Decomposition, grid: Partition, s: RigSettings, report: dict
+) -> list[Part]:
+    """Cut a limb-spanning layer, or leave it whole for the weights to handle."""
+    if not s.slice_limb_spanning:
+        return [part]
+    return _slice_by_regions(part, decomp, grid, s, report)
 
 
 def _slice_by_regions(
@@ -582,12 +595,43 @@ def enforce_limb_coverage(
 
 
 def verify_limb_separation(parts: list[Part]) -> dict:
-    """Post-condition check used by tests and surfaced in the pipeline report."""
-    present = {p.region for p in parts if p.region}
-    missing = [r for r in taxonomy.MANDATORY_LIMB_REGIONS if r not in present]
+    """Requirement 2-2's post-condition: arms and legs exist separately per side.
+
+    Checks for a distinct left and right part of each limb pair. It deliberately
+    does *not* require an upper/lower split -- bending at the elbow and knee is
+    the weighted mesh's job, and cutting there tears in motion (see
+    ``RigSettings.slice_limb_spanning``). When slicing is enabled the region
+    breakdown is reported too, but the pass/fail condition stays left-versus-right.
+    """
     sides: dict[str, int] = {"left": 0, "right": 0}
     for p in parts:
-        side = p.side
-        if side in sides:
-            sides[side] += 1
-    return {"ok": not missing, "missing_regions": missing, "parts_per_side": sides}
+        if p.side in sides:
+            sides[p.side] += 1
+
+    def has(tags: tuple[str, ...], regions: tuple[str, ...], side: str) -> bool:
+        for p in parts:
+            if p.side != side:
+                continue
+            # Either the layer is that limb (handwear-l is the left arm), or it is
+            # a slice carved out of a limb region (topwear@arm_l_upper), which is
+            # what the fallback produces for art that arrives as one blob.
+            if p.tag in tags or p.region in regions:
+                return True
+        return False
+
+    arm_regions = tuple(r for r in taxonomy.ARM_REGIONS)
+    leg_regions = tuple(r for r in taxonomy.LEG_REGIONS)
+    pairs = {
+        "arm": {s: has(taxonomy.ARM_TAGS, arm_regions, s) for s in ("left", "right")},
+        "leg": {s: has(taxonomy.LEG_TAGS, leg_regions, s) for s in ("left", "right")},
+    }
+    missing_limbs = [f"{limb}-{side}" for limb, per in pairs.items()
+                     for side, ok in per.items() if not ok]
+
+    present_regions = {p.region for p in parts if p.region}
+    return {
+        "ok": not missing_limbs,
+        "missing_limbs": missing_limbs,
+        "parts_per_side": sides,
+        "regions_present": sorted(r for r in present_regions if r),
+    }

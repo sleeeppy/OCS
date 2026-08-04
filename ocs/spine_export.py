@@ -202,25 +202,73 @@ def _sym(side: str, degrees: float) -> float:
     return degrees if side == "left" else -degrees
 
 
+#: Breath cycle length. Slow on purpose: a real resting breath is 3-4 s, and a
+#: short loop is the main thing that makes an idle read as mechanical.
+_BREATH = 3.6
+
+
 def _idle(available: set[str]) -> dict:
-    """Breathing sway, ~1.8 s loop. The one animation every rig should have."""
+    """Resting breath, 3.6 s loop.
+
+    Three things keep it from looking like a machine:
+
+    *Phase offsets.* The chest leads, the neck follows, the head follows the neck.
+    Moving everything on the same keyframes is what reads as a single rigid object
+    inflating.
+
+    *Counter-rotation.* As the chest rises the neck tips back a little and the head
+    tips forward against it, so the head stays roughly level instead of being
+    carried up bodily.
+
+    *Trailing amplitude.* Hair and tail swing wider and later than the body driving
+    them.
+
+    Amplitudes are small -- 3 px of rise, a degree or two of rotation. Idle is
+    peripheral motion; anything you can consciously watch is too much.
+    """
+    b = _BREATH
     bones: dict[str, dict] = {}
-    if "torso" in available:
-        bones["torso"] = {"translate": _trans((0, 0, 0), (0.9, 0, 2.5), (1.8, 0, 0))}
+
+    # Nothing moves ``torso``. It is the root of the whole body, so translating it
+    # lifts everything hanging off it -- including a skirt pooled on the floor.
+    # Measured on a seated figure with a 3 px chest rise: the bottom edge of the
+    # artwork moved 3 px too, which reads as the character floating. Breath is
+    # therefore driven from the neck up, which is where it is actually visible.
     if "neck" in available:
-        bones["neck"] = {"rotate": _rot((0, 0), (0.9, 1.4), (1.8, 0))}
+        # Asymmetric: inhale quicker than the exhale, as breathing actually is.
+        # Along local +x, which runs down the bone toward the head. Bone-local y is
+        # *perpendicular* to it, so translating y would slide the head sideways.
+        bones["neck"] = {
+            "translate": _trans(
+                (0, 0, 0), (b * 0.40, 2.6, 0), (b * 0.62, 2.0, 0), (b, 0, 0)
+            ),
+            "rotate": _rot((0, 0), (b * 0.45, 1.1), (b * 0.70, 0.5), (b, 0)),
+        }
     if "head" in available:
-        bones["head"] = {"rotate": _rot((0, 0), (0.6, -1.2), (1.2, 1.2), (1.8, 0))}
+        # Lags the neck and opposes it, so the head does not simply ride upward.
+        bones["head"] = {"rotate": _rot(
+            (0, 0), (b * 0.55, -1.0), (b * 0.80, 0.35), (b, 0)
+        )}
     for side in ("left", "right"):
         arm, elbow = f"{side}Arm", f"{side}Elbow"
+        # Shoulders open slightly with the chest; the forearm trails the upper arm.
         if arm in available:
-            bones[arm] = {"rotate": _rot((0, 0), (0.9, _sym(side, 2.2)), (1.8, 0))}
+            bones[arm] = {"rotate": _rot(
+                (0, 0), (b * 0.44, _sym(side, 1.5)), (b * 0.70, _sym(side, 0.7)), (b, 0)
+            )}
         if elbow in available:
-            bones[elbow] = {"rotate": _rot((0, 0), (0.9, _sym(side, 1.6)), (1.8, 0))}
+            bones[elbow] = {"rotate": _rot(
+                (0, 0), (b * 0.55, _sym(side, -1.1)), (b * 0.80, _sym(side, -0.4)), (b, 0)
+            )}
+
     if "hairBack" in available:
-        bones["hairBack"] = {"rotate": _rot((0, 0), (0.9, 2.0), (1.8, 0))}
+        bones["hairBack"] = {"rotate": _rot(
+            (0, 0), (b * 0.60, 1.6), (b * 0.85, -0.6), (b, 0)
+        )}
     if "tail" in available:
-        bones["tail"] = {"rotate": _rot((0, 0), (0.45, 6), (1.35, -6), (1.8, 0))}
+        bones["tail"] = {"rotate": _rot(
+            (0, 0), (b * 0.30, 3.5), (b * 0.65, -2.8), (b * 0.88, 1.0), (b, 0)
+        )}
     return {"bones": bones}
 
 
@@ -327,10 +375,18 @@ PRESETS = {
     "turn_head": _turn_head,
 }
 
+#: Exported unless asked otherwise.
+#:
+#: Only ``idle``, because it is the one animation that is right for any pose. The
+#: others assume a standing figure: a seated character cannot walk, and swinging a
+#: leg through a floor-length skirt looks broken however well the mesh deforms.
+#: The rest stay in ``PRESETS`` for callers that want them.
+DEFAULT_ANIMATIONS = ("idle",)
+
 
 def add_animations(doc: dict, rig: RigResult, names: list[str] | None = None) -> dict:
     available = {b.name for b in rig.bones}
-    for name in (names if names is not None else list(PRESETS)):
+    for name in (names if names is not None else list(DEFAULT_ANIMATIONS)):
         gen = PRESETS.get(name)
         if gen is None:
             continue

@@ -164,6 +164,66 @@ def _sample(keys: list[dict], time: float, fields: tuple[str, ...]) -> list[floa
 # drawing
 # --------------------------------------------------------------------------
 
+def _render_mesh(dst: np.ndarray, src: np.ndarray,
+                 src_pts: np.ndarray, dst_pts: np.ndarray, triangles: list[int]) -> None:
+    """Draw a whole triangle mesh in one pass, seam-free.
+
+    Compositing triangle by triangle cannot be made clean: antialiasing each one
+    leaves partial coverage that neighbours do not complete, and hard-filling
+    leaves the shared edge claimed by neither, so either way a grid of seams
+    appears over the artwork -- glaring on translucent fabric. Spine has no such
+    problem because the GPU draws the mesh as one triangle list with shared
+    vertices.
+
+    So this builds a destination-to-source coordinate map for the entire mesh
+    first, then does a single ``remap`` and a single composite. Every destination
+    pixel is written exactly once: no gaps, and no double-compositing either.
+    """
+    h, w = dst.shape[:2]
+    map_x = np.full((h, w), -1.0, np.float32)
+    map_y = np.full((h, w), -1.0, np.float32)
+
+    for t in range(0, len(triangles), 3):
+        idx = triangles[t:t + 3]
+        d = dst_pts[idx].astype(np.float32)
+        s = src_pts[idx].astype(np.float32)
+        x0, y0, bw, bh = cv2.boundingRect(d)
+        x0, y0 = max(0, x0 - 2), max(0, y0 - 2)
+        x1, y1 = min(w, x0 + bw + 4), min(h, y0 + bh + 4)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        try:
+            # Destination -> source, so the map can be filled by scanning dest px.
+            M = cv2.getAffineTransform(d, s)
+        except cv2.error:
+            continue
+
+        local = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        poly = np.int32(d - [x0, y0])
+        cv2.fillConvexPoly(local, poly, 255, cv2.LINE_8)
+        # Grow by one pixel so neighbouring triangles meet rather than leaving the
+        # shared edge unclaimed. Overlap is harmless here: both triangles map that
+        # edge to almost the same texel, and the map is overwritten, not blended.
+        cv2.polylines(local, [poly], True, 255, 2, cv2.LINE_8)
+
+        ys, xs = np.nonzero(local)
+        if ys.size == 0:
+            continue
+        gx = (xs + x0).astype(np.float32)
+        gy = (ys + y0).astype(np.float32)
+        map_x[ys + y0, xs + x0] = M[0, 0] * gx + M[0, 1] * gy + M[0, 2]
+        map_y[ys + y0, xs + x0] = M[1, 0] * gx + M[1, 1] * gy + M[1, 2]
+
+    valid = map_x >= 0
+    if not valid.any():
+        return
+    warped = cv2.remap(src, map_x, map_y, cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+    a = (warped[..., 3].astype(np.float32) / 255.0) * valid
+    dst[..., :3] = warped[..., :3] * a[..., None] + dst[..., :3] * (1 - a[..., None])
+    dst[..., 3] = np.clip(warped[..., 3] * valid + dst[..., 3] * (1 - a), 0, 255)
+
+
 def _warp_triangle(dst: np.ndarray, src: np.ndarray,
                    src_tri: np.ndarray, dst_tri: np.ndarray) -> None:
     """Affine-map one textured triangle into dst, alpha-compositing."""
@@ -187,7 +247,13 @@ def _warp_triangle(dst: np.ndarray, src: np.ndarray,
     warped = cv2.warpAffine(src_crop, M, (dw, dh), flags=cv2.INTER_LINEAR,
                             borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
     tri_mask = np.zeros((dh, dw), np.uint8)
-    cv2.fillConvexPoly(tri_mask, np.int32(d_local), 255, cv2.LINE_AA)
+    # LINE_8, not LINE_AA. Antialiasing each triangle separately leaves its edge
+    # pixels partly transparent, and two neighbours' partial coverages do not sum
+    # to one, so every shared edge becomes a seam -- a triangle grid over anything
+    # translucent. Spine draws the whole mesh as one triangle list with shared
+    # vertices and no per-triangle mask, so it has no such seams; this renderer
+    # must not invent them and then be read as evidence of a rigging fault.
+    cv2.fillConvexPoly(tri_mask, np.int32(d_local), 255, cv2.LINE_8)
 
     x1, y1 = max(0, dx), max(0, dy)
     x2, y2 = min(W, dx + dw), min(H, dy + dh)
@@ -245,9 +311,7 @@ def render(doc: dict, atlas_img: np.ndarray, atlas_size: tuple[int, int],
                 np.array(uvs[0::2], np.float32) * reg.w + reg.x,
                 np.array(uvs[1::2], np.float32) * reg.h + reg.y,
             ], axis=1)
-            for t in range(0, len(tris), 3):
-                tri = tris[t:t + 3]
-                _warp_triangle(out, atlas_img, src_pts[tri], pts[tri])
+            _render_mesh(out, atlas_img, src_pts, pts, tris)
         else:
             b = bones[slot["bone"]]
             w, h = float(body["width"]), float(body["height"])

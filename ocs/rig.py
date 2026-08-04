@@ -328,6 +328,32 @@ def _triangulate(points: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return simplices[inside & (area > 1.0)].astype(np.int32)
 
 
+def _region_bones_for(
+    part: Part, decomp: Decomposition, grid, min_share: float = 0.04
+) -> list[str]:
+    """Bones of the partition regions this part meaningfully covers.
+
+    Needed because layers are no longer cut per region: one attachment now spans a
+    whole limb, or a skirt spans the hips and the trunk, so its vertices have to be
+    weighted to every bone underneath it. Without this a skirt would ride one hip
+    alone.
+    """
+    mask = part.canvas_mask(decomp.canvas)
+    total = int(mask.sum())
+    if total == 0:
+        return []
+    labels = grid.labels(taxonomy.allowed_regions(part.tag, part.side))
+    vals, counts = np.unique(labels[mask], return_counts=True)
+    out: list[str] = []
+    for v, c in sorted(zip(vals.tolist(), counts.tolist()), key=lambda t: -t[1]):
+        if v < 0 or c < min_share * total:
+            continue
+        spec = grid.specs[int(v)]
+        if spec.bone not in out:
+            out.append(spec.bone)
+    return out
+
+
 def _candidate_bones(part: Part, rig: Rig, primary: str) -> list[str]:
     """Bones allowed to influence this part.
 
@@ -350,6 +376,14 @@ def _candidate_bones(part: Part, rig: Rig, primary: str) -> list[str]:
     if parent in available:
         chain.append(parent)
     chain.extend(_children_of(primary, available))
+    # Bones the part physically covers, plus each of their children, so a mesh
+    # spanning a joint can bend at it.
+    for bone in part.meta.get("region_bones", ()):
+        if bone not in chain:
+            chain.append(bone)
+        for kid in _children_of(bone, available):
+            if kid not in chain:
+                chain.append(kid)
 
     allowed = taxonomy.allowed_regions(part.tag, part.side)
     if allowed is not None:
@@ -666,6 +700,19 @@ def build_rig(
     ordered = _resolve_draw_order(parts, decomp)
     if s.restore_source_pixels:
         ordered = restore_source_pixels(ordered, decomp, s)
+
+    # Which bones each part sits on. Layers are no longer cut per region, so this
+    # is what lets one attachment be weighted across a whole limb or a skirt.
+    from .limbs import Partition
+    from .silhouette import character_mask
+
+    silhouette = character_mask(decomp, parts).mask
+    covered = np.zeros_like(silhouette)
+    for p in ordered:
+        covered |= p.canvas_mask(decomp.canvas)
+    grid = Partition(rig, silhouette | covered)
+    for p in ordered:
+        p.meta["region_bones"] = _region_bones_for(p, decomp, grid)
 
     for part in ordered:
         slug = naming.unique_slug(part.name)
