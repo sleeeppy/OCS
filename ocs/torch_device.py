@@ -29,8 +29,12 @@ Apple Silicon notes, all measured on an M5 Pro / 24 GB with torch 2.8.0:
 - ``torch.mps.recommended_max_memory()`` is 17.8 GB here, not the full 24 GB.
   see-through's README puts the plain path at 12-16 GB at 1280, so it fits, but
   not with much room -- drop ``--resolution`` first if it does not.
-- ``torch.cuda.empty_cache()`` and ``torch.cuda.manual_seed_all()``, which
-  see-through calls unguarded, are already no-ops when CUDA is absent. Left alone.
+- ``torch.cuda.empty_cache()`` is repointed at ``torch.mps.empty_cache()``. It is
+  a harmless no-op without CUDA, but harmless is not the same as working -- and
+  see-through calls it to hand back memory it has just freed. See
+  :func:`redirect_cuda_to`.
+- ``torch.cuda.manual_seed_all()`` is genuinely fine to leave: it registers a lazy
+  call that never fires, and ``torch.manual_seed`` already seeds MPS.
 - Group offloading is **required**, not optional. Without it a 1280 run peaked at
   a 35 GB physical footprint and 12 GB of swap on a 24 GB machine. See
   :func:`should_group_offload`.
@@ -197,6 +201,19 @@ def redirect_cuda_to(device: "object") -> None:
     torch.nn.Module.to = wrap_to(torch.nn.Module.to)
     torch.nn.Module.cuda = lambda self, *a, **k: self.to(device)
     torch.Tensor.cuda = lambda self, *a, **k: self.to(device)
+
+    # torch.cuda.empty_cache() is a safe no-op without CUDA, which is why it is
+    # tempting to leave alone -- but safe is not the same as working. see-through
+    # calls it at three points to hand memory back after freeing something big,
+    # the important one being right after it unloads both text encoders (~1.6 GB)
+    # and just before the denoise loop. Measured: after dropping 3 GB of tensors,
+    # torch.cuda.empty_cache() leaves driver_allocated_memory at 3.00 GB and
+    # torch.mps.empty_cache() takes it to 0.00. On a device whose budget is
+    # 17.8 GB, leaving that in the allocator is the difference between fitting and
+    # swapping.
+    if device.type == "mps":
+        torch.cuda.empty_cache = torch.mps.empty_cache
+        torch.cuda.synchronize = lambda *a, **k: torch.mps.synchronize()
 
     from diffusers import DiffusionPipeline, ModelMixin
 

@@ -229,3 +229,29 @@ def test_redirect_accepts_a_plain_string_device(monkeypatch):
     torch_device.redirect_cuda_to("cpu")          # not a torch.device
     assert torch.nn.Linear(2, 2).to("cuda").weight.device.type == "cpu"
     monkeypatch.setattr(torch_device, "_PATCHED", False)
+
+
+def test_empty_cache_is_repointed_on_mps(monkeypatch):
+    """A no-op empty_cache leaves freed memory in the allocator.
+
+    see-through calls torch.cuda.empty_cache() right after unloading both text
+    encoders. Without this the ~1.6 GB stays cached for the rest of the run.
+    """
+    monkeypatch.setattr(torch.nn.Module, "to", torch.nn.Module.to)
+    monkeypatch.setattr(torch.cuda, "empty_cache", torch.cuda.empty_cache)
+    monkeypatch.setattr(torch_device, "_PATCHED", False)
+
+    torch_device.redirect_cuda_to(torch.device("mps"))
+    assert torch.cuda.empty_cache is torch.mps.empty_cache
+    monkeypatch.setattr(torch_device, "_PATCHED", False)
+
+
+def test_empty_cache_is_left_alone_off_mps(monkeypatch):
+    monkeypatch.setattr(torch.nn.Module, "to", torch.nn.Module.to)
+    monkeypatch.setattr(torch.cuda, "empty_cache", torch.cuda.empty_cache)
+    monkeypatch.setattr(torch_device, "_PATCHED", False)
+    original = torch.cuda.empty_cache
+
+    torch_device.redirect_cuda_to(torch.device("cpu"))
+    assert torch.cuda.empty_cache is original
+    monkeypatch.setattr(torch_device, "_PATCHED", False)
