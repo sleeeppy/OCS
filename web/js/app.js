@@ -55,9 +55,14 @@ const App = (() => {
     card.classList.toggle("hidden", !active && state.stage !== "failed");
     $("bar-fill").style.width = `${Math.round((state.progress || 0) * 100)}%`;
     $("progress-msg").textContent = state.stage === "failed"
-      ? (state.error || "실패")
+      ? translateWarning(state.error || "실패")
       : `${state.stage} · ${state.message || ""}`;
     $("progress-msg").style.color = state.stage === "failed" ? "var(--danger)" : "";
+    // A failed separation is almost always retryable, so give it a button rather
+    // than leaving the user with a dead progress bar.
+    $("btn-retry-separate").classList.toggle(
+      "hidden", !(state.stage === "failed" && projectId)
+    );
   }
 
   function renderWarnings(list) {
@@ -85,6 +90,12 @@ const App = (() => {
     }
     if (w.startsWith("background_estimate_degenerate")) {
       return "배경 추정 결과가 비정상이라 레이어 기반으로 대체했습니다.";
+    }
+    if (w.startsWith("The server restarted while layers were being separated")) {
+      return "서버가 재시작되면서 레이어 분리 작업이 유실됐습니다. 다시 실행하면 됩니다.";
+    }
+    if (w.startsWith("GPU busy")) {
+      return "GPU가 다른 프로젝트를 처리 중입니다. 끝난 뒤 다시 시도하세요.";
     }
     return w;
   }
@@ -399,6 +410,18 @@ const App = (() => {
     });
     $("btn-verify").addEventListener("click", verifyPartition);
     $("btn-export").addEventListener("click", runExport);
+    $("btn-retry-separate").addEventListener("click", async () => {
+      const btn = $("btn-retry-separate");
+      btn.disabled = true;
+      try {
+        await API.separate(projectId);
+        Toast.info("레이어 분리를 다시 시작했습니다");
+      } catch (err) {
+        Toast.err(`다시 실행 실패: ${err.message}`);
+      } finally {
+        btn.disabled = false;
+      }
+    });
     $("btn-reset-rig").addEventListener("click", async () => {
       try {
         const rig = await API.getRig(projectId);
