@@ -34,9 +34,6 @@ def main() -> int:
         print(f"error: {script} not found", file=sys.stderr)
         return 1
 
-    # Before torch is imported anywhere, so the env var is read in time.
-    torch_device.enable_mps_fallback()
-
     device = torch_device.select_device()
     info = torch_device.describe(device)
     print(
@@ -45,6 +42,13 @@ def main() -> int:
         + f") torch {info['torch']}",
         flush=True,
     )
+
+    if device.type == "mps":
+        # Must be set before MPS initialises, and the allocator cap in here is
+        # load-bearing -- see configure_mps_env for what the default does.
+        for key, value in torch_device.configure_mps_env().items():
+            print(f"[ocs] {key}={value}", flush=True)
+
     torch_device.redirect_cuda_to(device)
 
     # Drop our own argv[1] so the target sees the argv it expects.

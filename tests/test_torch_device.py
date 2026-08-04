@@ -255,3 +255,79 @@ def test_empty_cache_is_left_alone_off_mps(monkeypatch):
     torch_device.redirect_cuda_to(torch.device("cpu"))
     assert torch.cuda.empty_cache is original
     monkeypatch.setattr(torch_device, "_PATCHED", False)
+
+
+def test_mps_env_caps_the_allocator_inside_physical_ram(monkeypatch):
+    """The default high watermark is 1.7x recommended, which overshoots RAM.
+
+    On a 24 GB machine that is a 30 GB ceiling, and the allocator uses it -- the
+    driver reached 30.9 GB and drove 25 GB of swap. The cap has to land below
+    physical RAM or the run degrades without bound.
+    """
+    import os
+
+    for key in ("PYTORCH_ENABLE_MPS_FALLBACK",
+                "PYTORCH_MPS_HIGH_WATERMARK_RATIO",
+                "PYTORCH_MPS_LOW_WATERMARK_RATIO"):
+        monkeypatch.delenv(key, raising=False)
+
+    env = torch_device.configure_mps_env()
+    assert env["PYTORCH_ENABLE_MPS_FALLBACK"] == "1"
+
+    if not torch.backends.mps.is_available():
+        pytest.skip("watermark ratios are only set where MPS exists")
+
+    high = float(env["PYTORCH_MPS_HIGH_WATERMARK_RATIO"])
+    low = float(env["PYTORCH_MPS_LOW_WATERMARK_RATIO"])
+    recommended = torch.mps.recommended_max_memory()
+    physical = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+
+    assert recommended * high < physical, "ceiling must sit inside physical RAM"
+    assert high < 1.7, "must be below torch's default, which is the bug"
+    assert 0 < low < high, "purge threshold has to trip before the ceiling"
+
+
+def test_mps_env_does_not_override_a_deliberate_setting(monkeypatch):
+    monkeypatch.setenv("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.5")
+    env = torch_device.configure_mps_env()
+    assert env["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] == "0.5"
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS only")
+def test_five_dim_sortlike_does_not_abort_the_process():
+    """MPSNDArraySort supports axes 0-3; a 5-D reduction calls abort().
+
+    Not raises -- aborts. SIGABRT, uncatchable, and it fires after the denoise
+    loop has already spent 15 minutes. LayerDiff 3D reduces over the leading axis
+    of (augment, batch, channel, h, w) in vae.py and in marigold's ensemble.
+    """
+    torch_device.guard_mps_sort_ndim()
+    x = torch.randn(3, 2, 4, 8, 8, device="mps")
+
+    r = torch.median(x, dim=0)
+    # The structseq type has to survive the CPU round trip: callers use .values.
+    assert type(r).__name__ == "median"
+    assert r.values.shape == (2, 4, 8, 8)
+    assert r.values.device.type == "mps"
+    # Right answer, not merely a surviving one.
+    assert torch.allclose(r.values.cpu(), torch.median(x.cpu(), dim=0).values)
+
+    assert torch.sort(x, dim=0).values.device.type == "mps"
+    assert torch.quantile(x.float(), 0.5, dim=0).device.type == "mps"
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS only")
+def test_four_dim_stays_on_mps():
+    """The guard must not add a CPU round trip to shapes MPS handles fine."""
+    torch_device.guard_mps_sort_ndim()
+    x = torch.randn(2, 4, 8, 8, device="mps")
+    assert torch.median(x, dim=0).values.device.type == "mps"
+    assert x.ndim == torch_device._MPS_SORT_MAX_NDIM
+
+
+def test_sort_guard_leaves_cpu_tensors_alone():
+    torch_device.guard_mps_sort_ndim()
+    x = torch.randn(3, 2, 2, 2, 2)
+    r = torch.median(x, dim=0)
+    assert r.values.device.type == "cpu"
+    assert torch.allclose(r.values, torch.median(x, dim=0).values)

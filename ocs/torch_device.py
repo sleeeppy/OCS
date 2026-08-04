@@ -38,6 +38,11 @@ Apple Silicon notes, all measured on an M5 Pro / 24 GB with torch 2.8.0:
 - Group offloading is **required**, not optional. Without it a 1280 run peaked at
   a 35 GB physical footprint and 12 GB of swap on a 24 GB machine. See
   :func:`should_group_offload`.
+- The MPS allocator's default ceiling is 1.7x the recommended working set, which
+  on a 24 GB machine is 30 GB -- past physical RAM, into swap. See
+  :func:`configure_mps_env`.
+- Sort-like reductions over 5-D tensors abort the process outright. See
+  :func:`guard_mps_sort_ndim`.
 """
 
 from __future__ import annotations
@@ -164,6 +169,80 @@ def cap_resolution(resolution: int, device: "object") -> tuple[int, str | None]:
     )
 
 
+#: MPS's sort kernel (``MPSNDArraySort``) only handles axes 0-3, so any sort-like
+#: reduction over a tensor with more dimensions than this has to go via CPU.
+_MPS_SORT_MAX_NDIM = 4
+
+#: Reductions that MPS implements on top of that sort kernel.
+_SORT_LIKE = ("median", "sort", "msort", "quantile", "nanmedian", "nanquantile",
+              "kthvalue", "mode")
+
+
+def guard_mps_sort_ndim() -> None:
+    """Route sort-like reductions over >4-D tensors through CPU on MPS.
+
+    LayerDiff 3D carries ``(augment, batch, channel, h, w)`` tensors, and both
+    ``layerdiffuse/vae.py`` (``torch.median(result, dim=0)`` over the augmentation
+    stack) and ``marigold/util/ensemble.py`` (four ``torch.median(..., dim=0)``
+    calls over the ensemble) reduce across the leading axis of one. MPS lowers that
+    to ``MPSNDArraySort``, which supports axes 0-3 only:
+
+        MPSNDArraySort.mm:252: failed assertion
+        `Axis = 4. This class only supports axis = 0, 1, 2, 3'
+
+    That is a Metal assertion, not a Python exception: it calls ``abort()``, the
+    process dies with SIGABRT, and no ``try``/``except`` or
+    ``PYTORCH_ENABLE_MPS_FALLBACK`` can intercept it -- the op *is* implemented,
+    just not at this rank. So the check has to be made before the call, on ndim.
+
+    It is also why this cannot be left to fail loudly and be fixed later: it fires
+    after the 15-minute denoise loop has already finished, taking the whole run
+    with it.
+    """
+    import torch
+
+    def wrap(name: str):
+        original = getattr(torch, name)
+
+        def patched(input, *args, **kwargs):
+            if (
+                isinstance(input, torch.Tensor)
+                and input.device.type == "mps"
+                and input.ndim > _MPS_SORT_MAX_NDIM
+            ):
+                result = original(input.cpu(), *args, **kwargs)
+                return _to_device(result, input.device)
+            return original(input, *args, **kwargs)
+
+        patched.__name__ = name
+        patched.__doc__ = original.__doc__
+        return patched
+
+    for name in _SORT_LIKE:
+        if hasattr(torch, name):
+            setattr(torch, name, wrap(name))
+
+
+def _to_device(result: Any, device: Any) -> Any:
+    """Move a tensor, or the tensors inside a return_types structseq, to ``device``.
+
+    ``torch.median(x, dim=0)`` hands back a ``torch.return_types.median``, and
+    callers reach for ``.values``, so the type has to survive the round trip --
+    returning a plain tuple would break ``.values`` at the call site.
+    """
+    import torch
+
+    if isinstance(result, torch.Tensor):
+        return result.to(device)
+    if isinstance(result, tuple):
+        moved = [v.to(device) if isinstance(v, torch.Tensor) else v for v in result]
+        try:
+            return type(result)(moved)
+        except TypeError:
+            return tuple(moved)
+    return result
+
+
 def _redirect(value: Any, target: Any) -> Any:
     """Map a CUDA device reference to ``target``; pass everything else through."""
     import torch
@@ -214,6 +293,7 @@ def redirect_cuda_to(device: "object") -> None:
     if device.type == "mps":
         torch.cuda.empty_cache = torch.mps.empty_cache
         torch.cuda.synchronize = lambda *a, **k: torch.mps.synchronize()
+        guard_mps_sort_ndim()
 
     from diffusers import DiffusionPipeline, ModelMixin
 
@@ -254,10 +334,57 @@ def redirect_cuda_to(device: "object") -> None:
     _PATCHED = True
 
 
-def enable_mps_fallback() -> None:
-    """Let unimplemented MPS ops fall back to CPU rather than raising.
+#: Fraction of physical RAM the MPS allocator may hold. The rest is the OS's.
+_MPS_RAM_BUDGET = 0.62
 
-    Set before torch reads it. Slow where it triggers, but the alternative is a
-    hard stop partway through a 20-minute run over one missing kernel.
+
+def configure_mps_env() -> dict[str, str]:
+    """Environment torch must see *before* it initialises MPS.
+
+    Two settings, and the second one is the difference between a run finishing and
+    a run that looks like it hung.
+
+    ``PYTORCH_ENABLE_MPS_FALLBACK`` lets an unimplemented MPS op drop to CPU
+    rather than raising. Slow where it triggers, better than a hard stop partway
+    through a long run over one missing kernel.
+
+    ``PYTORCH_MPS_HIGH_WATERMARK_RATIO`` caps the allocator, and its default is
+    the trap. The ratio is relative to ``recommended_max_memory()`` -- 17.8 GB
+    here -- and it defaults to **1.7**, so the allocator is free to grow to
+    30.2 GB on a machine with 24 GB of RAM. It does exactly that: measured over
+    one 768 run, the GPU driver reached 30.9 GB of allocated system memory (1.7 x
+    17.76 = 30.19, so this is the ratio and nothing else), which put the system
+    25.7 GB into swap. The process footprint stayed a healthy 13 GB the whole
+    time, which is why this hides from the obvious diagnostic -- the growth is in
+    the driver's cache, not the process heap.
+
+    What it looks like: step time climbing without bound while the GPU stays busy.
+
+        step  1-2    22 s/it
+        step 20     153 s/it
+        step 21     356 s/it
+        step 23     427 s/it
+
+    Capping the allocator inside physical RAM is what stops that. The low
+    watermark is set below the high one so cached blocks get purged before the
+    allocator reaches for more.
+
+    Returns the variables it set, for logging.
     """
-    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+    import torch
+
+    env = {"PYTORCH_ENABLE_MPS_FALLBACK": "1"}
+
+    recommended = torch.mps.recommended_max_memory()
+    if recommended > 0:
+        physical = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        budget = physical * _MPS_RAM_BUDGET
+        # Never raise the ceiling above what Metal recommends for one working set;
+        # this is only ever meant to lower it.
+        high = min(budget / recommended, 1.0)
+        env["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = f"{high:.2f}"
+        env["PYTORCH_MPS_LOW_WATERMARK_RATIO"] = f"{high * 0.7:.2f}"
+
+    for key, value in env.items():
+        os.environ.setdefault(key, value)
+    return {k: os.environ[k] for k in env}
