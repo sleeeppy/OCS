@@ -76,14 +76,17 @@ Two findings that only showed up by running it:
 
 ## Requirements
 
-- Windows (paths and helper scripts are PowerShell; the Python is portable)
-- An NVIDIA GPU. 16 GB is comfortable; 8 GB works with the low-VRAM paths.
 - [uv](https://github.com/astral-sh/uv), Python 3.12, git
-- ~20 GB free for model weights
+- For the layer-decomposition stage: an NVIDIA GPU. 16 GB is comfortable; 8 GB
+  works with the low-VRAM paths. ~20 GB free for model weights.
 
 Verified on: Windows 11, RTX 5070 Ti (16 GB, sm_120), CUDA 12.8, Python 3.12.13,
 torch 2.8.0+cu128. Blackwell cards need cu128 wheels — earlier builds have no
 sm_120 kernels.
+
+Also verified on macOS 15 / Apple M5 Pro (24 GB) with **no GPU stage** — see
+[Without a GPU](#without-a-gpu) below. Helper scripts come in both flavours:
+`.ps1` for Windows, `.sh` for macOS and Linux. The Python is portable either way.
 
 ## Setup
 
@@ -92,6 +95,18 @@ git clone --recurse-submodules https://github.com/sleeeppy/OCS.git
 cd OCS
 ./scripts/setup_env.ps1
 ```
+
+macOS / Linux:
+
+```bash
+./scripts/setup_env.sh              # OCS only, no GPU stage — under a minute
+./scripts/setup_env.sh --with-gpu   # + torch and see-through's requirements
+```
+
+The two setup scripts differ in one deliberate way. `setup_env.ps1` exits
+non-zero when `torch.cuda.is_available()` is false, because on Windows that means
+a broken install. `setup_env.sh` only reports it: the GPU is needed for exactly
+one stage, and failing there would block a stack that is otherwise fully usable.
 
 One virtualenv holds both OCS and see-through. see-through's `requirements.txt`
 already pins the heavy half of what OCS needs (numpy, opencv, pillow, scipy,
@@ -111,7 +126,11 @@ from unpkg instead.
 ## Run
 
 ```powershell
-./scripts/run_ocs.ps1
+./scripts/run_ocs.ps1     # Windows
+```
+
+```bash
+./scripts/run_ocs.sh      # macOS / Linux
 ```
 
 Then open <http://127.0.0.1:8765/>. Drop in an illustration and work through the
@@ -170,19 +189,55 @@ by hand in the editor.
 see-through's own convention in `label_lr_split`, where the lower-centroid-x
 component is tagged `-r`. Getting it backwards mirrors every animation.
 
-## Without a GPU run
+## Without a GPU
 
-Already have see-through output, or want to iterate on cleanup, partitioning or
-rigging without paying for inference each time:
+Decomposition is the only stage that needs one. Cleanup, silhouette, bone
+placement, limb partition, meshing, weighting, atlas packing, Spine export and
+the preview are numpy/opencv/scipy and run anywhere — so on a machine with no
+NVIDIA card the editor still works end to end, it just needs its layers from
+somewhere else.
 
-```powershell
-.venv/Scripts/python.exe scripts/import_psd.py workspace/seethrough/foo.psd
-.venv/Scripts/python.exe scripts/render_debug.py
+Already have see-through output, or want to iterate on the later stages without
+paying for inference each time:
+
+```bash
+.venv/bin/python scripts/import_psd.py workspace/seethrough/foo.psd
+```
+
+No GPU anywhere and no PSD to import — there is nothing for the editor to open
+past the upload step. Build a project from a synthetic decomposition instead:
+
+```bash
+.venv/bin/python scripts/make_demo_project.py --all
+```
+
+The layouts in `ocs/demo.py` are measured from see-through's own sample, not
+idealised: `handwear` is a whole arm, `legwear` is both legs in one layer, there
+is no skin tag, and the empty/duplicate/speck layers are present. `--figure blob`
+is the interesting one — a single connected silhouette in a single layer with
+arms fused to the torso and no left/right suffixes anywhere, so only the bone
+skeleton can separate the sides. `tests/conftest.py` wraps the same builders.
+
+```bash
+.venv/bin/python scripts/render_debug.py --project <id>
 ```
 
 `render_debug.py` writes a sheet showing the source, the silhouette, the bones and
 the bone partition — handy for judging a rig at a glance or filing a bug that
-shows what OCS actually decided.
+shows what OCS actually decided. For a project it draws the rig in effect,
+including your edits.
+
+### Known limitation
+
+`skeleton.guess_rig`'s geodesic fallback misplaces the leg chain on the `blob`
+figure: it reads the fused torso block's lower corners as extremities and puts
+`{side}Knee` and `{side}Foot` at the bottom of the torso instead of down the
+legs, leaving the legs unclaimed by any joint. The partition still verifies 4:4
+because `Rig.segment` extrapolates open chain ends far enough to sweep them — so
+`verify_limb_separation` passing is not on its own evidence that the joints are
+where they belong. Drag them in step 3, or start from a decomposition that has
+per-limb layers. Only the single-blob input is affected; a real see-through PSD
+places these from layers (`source: "layer"`), which is correct.
 
 ## Layout
 
@@ -190,6 +245,7 @@ shows what OCS actually decided.
 ocs/
   taxonomy.py     see-through's 23 tags, the bone template, tag→region/bone rules
   seethrough.py   subprocess driver for the submodule
+  demo.py         synthetic decompositions for the no-GPU path and the tests
   psd_io.py       PSD + sidecars → Part objects
   silhouette.py   character outline (harder than it sounds — see the module docstring)
   cleanup.py      requirement 2: dummy-layer detection, two tiers
@@ -207,8 +263,9 @@ tests/            pytest; fixtures modelled on real see-through output
 
 ## Tests
 
-```powershell
-.venv/Scripts/python.exe -m pytest tests -q
+```bash
+.venv/bin/python -m pytest tests -q          # macOS / Linux
+.venv/Scripts/python.exe -m pytest tests -q  # Windows
 ```
 
 The interesting cases are the hard ones: a single connected silhouette in a single

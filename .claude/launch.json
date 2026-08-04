@@ -3,6 +3,12 @@
   "configurations": [
     {
       "name": "ocs",
+      "runtimeExecutable": ".venv/bin/python",
+      "runtimeArgs": ["scripts/serve.py", "--port", "8765"],
+      "port": 8765
+    },
+    {
+      "name": "ocs-windows",
       "runtimeExecutable": ".venv/Scripts/python.exe",
       "runtimeArgs": ["scripts/serve.py", "--port", "8765"],
       "port": 8765

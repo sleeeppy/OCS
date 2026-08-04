@@ -296,11 +296,40 @@ def load_rig(project: Project) -> skeleton.Rig:
     return skeleton.Rig.from_dict(json.loads(project.rig_path.read_text(encoding="utf-8")))
 
 
+def load_decomposition(project: Project) -> psd_io.Decomposition:
+    """The project's layers, from wherever this project keeps them.
+
+    Normally that is the PSD see-through wrote. A demo project
+    (``scripts/make_demo_project.py``) has no PSD because the machine has no
+    CUDA to produce one, and rebuilds its synthetic decomposition instead --
+    deterministic, so it re-derives identically on every call.
+    """
+    stored = project.state.get("psd")
+    if stored:
+        return psd_io.read_decomposition(project.root / stored)
+
+    figure = project.state.get("demo")
+    if figure:
+        from . import demo
+        try:
+            return demo.FIGURES[figure]()
+        except KeyError:
+            raise ValueError(
+                f"project {project.id} names demo figure {figure!r}, which no "
+                f"longer exists. Known: {sorted(demo.FIGURES)}"
+            ) from None
+
+    raise ValueError(
+        f"project {project.id} has neither a PSD nor a demo figure to load. "
+        "Run the separation stage, scripts/import_psd.py, or "
+        "scripts/make_demo_project.py."
+    )
+
+
 def resolved_parts(project: Project) -> tuple[psd_io.Decomposition, list[psd_io.Part], skeleton.Rig]:
-    """Re-derive the surviving parts from the stored PSD + review decisions."""
+    """Re-derive the surviving parts from the stored layers + review decisions."""
     s = project.settings()
-    psd = project.root / project.state["psd"]
-    decomp = psd_io.read_decomposition(psd)
+    decomp = load_decomposition(project)
     reports = cleanup.analyze(decomp, s.cleanup)
     kept, _dropped = cleanup.apply_verdicts(
         decomp, reports,
