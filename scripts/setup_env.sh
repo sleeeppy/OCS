@@ -78,6 +78,12 @@ if [ "$WITH_GPU" -eq 1 ]; then
   # cwd must be the submodule root: its requirements.txt has relative editable
   # entries (-e ./common, -e ./annotators).
   ( cd "$SEE_THROUGH" && uv pip install -r requirements.txt )
+
+  # see-through's own setup instructions end with this. Its scripts default to
+  # assets/... paths that only resolve through the link, so --srcp with a default
+  # fails without it.
+  echo "== linking see-through assets"
+  ln -sfn common/assets "$SEE_THROUGH/assets"
 fi
 
 echo "== checking the GPU stage"
@@ -87,11 +93,14 @@ echo "== checking the GPU stage"
 from ocs import seethrough
 info = seethrough.check_environment()
 if info.get('ok'):
-    print(f\"  torch {info['torch']}  cuda {info['device']}  {info['vram_gb']} GB\")
+    mem = f\"  {info['memory_gb']} GB\" if info.get('memory_gb') else ''
+    print(f\"  torch {info['torch']}  {info['device']}  {info['name']}{mem}\")
     print('  see-through decomposition: available')
+    if info['device'] == 'mps':
+        print('  keep group offload ON; without it a 1280 run swaps on 24 GB')
 else:
     print('  see-through decomposition: NOT available on this machine')
-    print('  (no CUDA GPU / torch not installed)')
+    print(f\"  {info.get('error', 'no accelerator found')}\".rstrip())
     print('  Everything after decomposition still works. To get an input:')
     print('    python scripts/make_demo_project.py --all   # synthetic, no GPU')
     print('    python scripts/import_psd.py <file.psd>     # PSD from elsewhere')

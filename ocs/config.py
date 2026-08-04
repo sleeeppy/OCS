@@ -34,7 +34,10 @@ class SeeThroughSettings:
 
     ``group_offload`` defaults on: see-through's own README puts the plain path
     at 12-16 GB of VRAM at 1280, which is right at the edge on a 16 GB card,
-    while group offload brings the peak to ~10 GB for a modest speed cost.
+    while group offload brings the peak to ~10 GB for a modest speed cost. On
+    Apple Silicon it is not a nicety -- without it a 1280 run swaps. Only CPU,
+    where there is nothing to offload to, drops the flag. See
+    ``ocs.torch_device.should_group_offload``.
     """
 
     resolution: int = 1280
@@ -46,7 +49,7 @@ class SeeThroughSettings:
     #: tags; OCS handles the rest of the L/R work itself (see ocs.limbs).
     tblr_split: bool = True
 
-    def to_args(self) -> list[str]:
+    def to_args(self, device_type: str = "cuda") -> list[str]:
         args = [
             "--resolution", str(self.resolution),
             "--resolution_depth", str(self.resolution_depth),
@@ -54,7 +57,7 @@ class SeeThroughSettings:
             "--seed", str(self.seed),
             "--save_to_psd",
         ]
-        if self.group_offload:
+        if self.group_offload and device_type in ("cuda", "mps"):
             args.append("--group_offload")
         if self.tblr_split:
             args.append("--tblr_split")

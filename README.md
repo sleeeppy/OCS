@@ -77,16 +77,17 @@ Two findings that only showed up by running it:
 ## Requirements
 
 - [uv](https://github.com/astral-sh/uv), Python 3.12, git
-- For the layer-decomposition stage: an NVIDIA GPU. 16 GB is comfortable; 8 GB
-  works with the low-VRAM paths. ~20 GB free for model weights.
+- For the layer-decomposition stage: an NVIDIA GPU **or** Apple Silicon.
+  ~20 GB free for model weights.
 
-Verified on: Windows 11, RTX 5070 Ti (16 GB, sm_120), CUDA 12.8, Python 3.12.13,
-torch 2.8.0+cu128. Blackwell cards need cu128 wheels — earlier builds have no
-sm_120 kernels.
+| | |
+|---|---|
+| **NVIDIA** | 16 GB is comfortable; 8 GB works with the low-VRAM paths. Verified on Windows 11, RTX 5070 Ti (16 GB, sm_120), CUDA 12.8, torch 2.8.0+cu128. Blackwell cards need cu128 wheels — earlier builds have no sm_120 kernels. |
+| **Apple Silicon** | Verified on macOS 15 / M5 Pro, 24 GB unified, torch 2.8.0 MPS. Slower than a discrete card. See [Apple Silicon](#apple-silicon). |
+| **Neither** | Everything except decomposition still runs. See [Without a GPU](#without-a-gpu). |
 
-Also verified on macOS 15 / Apple M5 Pro (24 GB) with **no GPU stage** — see
-[Without a GPU](#without-a-gpu) below. Helper scripts come in both flavours:
-`.ps1` for Windows, `.sh` for macOS and Linux. The Python is portable either way.
+Helper scripts come in both flavours: `.ps1` for Windows, `.sh` for macOS and
+Linux. The Python is portable either way.
 
 ## Setup
 
@@ -148,7 +149,8 @@ minutes per image.
 
 1. **Upload** — resolution, steps and seed are under *고급 설정*. `group offload`
    is on by default: the plain path peaks at 12–16 GB at 1280, right at the edge
-   of a 16 GB card, while offload brings it to ~10 GB.
+   of a 16 GB card, while offload brings it to ~10 GB. Leave it on for MPS —
+   without it a 1280 run swaps.
 2. **Layer cleanup** — thumbnails with the reason each layer was dropped or
    flagged. Untick to exclude; auto-dropped layers can be brought back.
 3. **Bone placement** — drag the joints. `Shift`+drag moves the subtree, `X`
@@ -188,6 +190,74 @@ by hand in the editor.
 **`right` means the character's right, i.e. the viewer's left.** This matches
 see-through's own convention in `label_lr_split`, where the lower-centroid-x
 component is tagged `-r`. Getting it backwards mirrors every animation.
+
+## Apple Silicon
+
+see-through targets CUDA and says so in eight places, all in
+`common/utils/inference_utils.py` — five `.to(device='cuda')` calls on the
+layerdiff sub-modules, `marigold_pipeline.to(device='cuda')`, and two
+`enable_group_offload('cuda', …)`. Everything downstream reads the device back
+off the modules (`self.unet.device`, `vae.device`), so those eight sites are the
+whole story: move the modules and the rest follows.
+
+[`ocs/torch_device.py`](ocs/torch_device.py) redirects them at runtime instead of
+patching the submodule, which `git submodule update` would revert. The rewrite is
+narrow — a *requested* CUDA device becomes the real one and nothing else changes,
+so `.to('cpu')` still means CPU and a dtype-only `.to()` is untouched.
+[`scripts/run_seethrough.py`](scripts/run_seethrough.py) applies it and then hands
+off to see-through's own script through `runpy`, argv untouched.
+
+Setup is the same command with one flag:
+
+```bash
+./scripts/setup_env.sh --with-gpu
+```
+
+What was measured on an M5 Pro / 24 GB, torch 2.8.0:
+
+- bf16 matmul, `conv2d`, `group_norm` and `scaled_dot_product_attention` all work,
+  and `torch.Generator(device='mps')` seeds `randn` reproducibly — the dtype
+  see-through asks for needs no downgrade.
+- `torch.cuda.empty_cache()` and `torch.cuda.manual_seed_all()`, which see-through
+  calls unguarded, are already no-ops when CUDA is absent — left alone.
+- `PYTORCH_ENABLE_MPS_FALLBACK=1` is set, so a missing MPS kernel drops to CPU
+  instead of ending the run.
+
+### Resolution is capped at 768 on MPS
+
+This is the one place Apple Silicon does not just work, and it is not about the
+weights. **MPS has no memory-efficient SDPA kernel** — it materialises the
+attention score matrix, so cost grows with the square of the token count.
+Measured directly, bf16, 10 heads, `driver_allocated_memory` after a *single*
+`scaled_dot_product_attention`:
+
+| `--resolution` | latent tokens | allocated by one attention call |
+|---|---|---|
+| 768 | 9,216 | 4.2 GB |
+| 1024 | 16,384 | 12.6 GB |
+| 1280 | 25,600 | **25.4 GB** |
+
+`torch.mps.recommended_max_memory()` is 17.8 GB here, so see-through's default
+1280 exceeds the budget on attention alone — before any of the ~8 GB of SDXL
+weights. And it does not fail cleanly: macOS swaps instead, so the run sits at
+step 0/30 with the GPU busy and 12 GB of swap in use, looking like a hang.
+
+`scripts/run_seethrough.py` therefore clamps `--resolution` to
+`torch_device.MPS_MAX_RESOLUTION` and prints the override rather than silently
+producing a smaller decomposition than asked for. Raise the constant if a future
+torch ships a flash-attention path for MPS.
+
+**Group offloading cannot fix that** — it pages *parameters*, and this is
+activations. Keep it on anyway: it is what brought the peak footprint from 35 GB
+down to 17 GB. diffusers' implementation does work on MPS (verified end to end on
+a real `UNet2DConditionModel`, finite bf16 output) on one condition, which
+`redirect_cuda_to` enforces: `use_stream` must stay `False`. The streamed path
+builds a pinned-memory dict, and `Tensor.pin_memory()` fails on this machine
+(*"Attempted to set the storage of a tensor on device cpu to a storage on
+different device mps:0"*). see-through never passes `use_stream`, so the default
+already avoids it; the wrapper pins it off regardless.
+
+`OCS_TORCH_DEVICE=cpu` forces the device choice if a driver bug shows up mid-run.
 
 ## Without a GPU
 
@@ -245,6 +315,7 @@ places these from layers (`source: "layer"`), which is correct.
 ocs/
   taxonomy.py     see-through's 23 tags, the bone template, tag→region/bone rules
   seethrough.py   subprocess driver for the submodule
+  torch_device.py accelerator choice + the cuda→mps redirection
   demo.py         synthetic decompositions for the no-GPU path and the tests
   psd_io.py       PSD + sidecars → Part objects
   silhouette.py   character outline (harder than it sounds — see the module docstring)

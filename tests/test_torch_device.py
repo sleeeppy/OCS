@@ -1,0 +1,231 @@
+"""The cuda→device redirection has to be narrow, not a blanket rewrite.
+
+The risk is not that `device='cuda'` fails to move -- that is the easy half and
+obvious when it breaks. It is that the patch is too eager and quietly drags
+something else onto the accelerator: `.to('cpu')` is used all over see-through's
+post-processing to pull tensors back for numpy, and a `.to(dtype)` with no device
+must not relocate anything.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+torch = pytest.importorskip("torch", reason="the GPU half is an optional install")
+
+from ocs import torch_device
+
+
+@pytest.fixture
+def target(monkeypatch):
+    """Redirect to CPU, on a fresh copy of the methods the patch replaces.
+
+    CPU is the one target every machine has, and it is still a *different* device
+    from the 'cuda' being asked for, so the rewrite is genuinely exercised.
+    """
+    monkeypatch.setattr(torch.nn.Module, "to", torch.nn.Module.to)
+    monkeypatch.setattr(torch.nn.Module, "cuda", torch.nn.Module.cuda)
+    monkeypatch.setattr(torch.Tensor, "cuda", torch.Tensor.cuda)
+    monkeypatch.setattr(torch_device, "_PATCHED", False)
+    device = torch.device("cpu")
+    torch_device.redirect_cuda_to(device)
+    monkeypatch.setattr(torch_device, "_PATCHED", False)
+    return device
+
+
+def test_selects_override_first(monkeypatch):
+    monkeypatch.setenv("OCS_TORCH_DEVICE", "cpu")
+    assert torch_device.select_device().type == "cpu"
+
+
+def test_explicit_prefer_beats_env(monkeypatch):
+    monkeypatch.setenv("OCS_TORCH_DEVICE", "cuda")
+    assert torch_device.select_device("cpu").type == "cpu"
+
+
+def test_group_offload_on_accelerators_but_not_cpu():
+    # MPS needs it more than CUDA does: without it a 1280 run swaps on 24 GB.
+    assert torch_device.should_group_offload(torch.device("cuda"), requested=True)
+    assert torch_device.should_group_offload(torch.device("mps"), requested=True)
+    # Nothing to offload to on CPU.
+    assert not torch_device.should_group_offload(torch.device("cpu"), requested=True)
+    # And an unrequested offload stays off even where it would work.
+    assert not torch_device.should_group_offload(torch.device("cuda"), requested=False)
+
+
+def test_settings_pass_group_offload_to_accelerators():
+    from ocs.config import SeeThroughSettings
+
+    s = SeeThroughSettings(group_offload=True)
+    assert "--group_offload" in s.to_args(device_type="cuda")
+    assert "--group_offload" in s.to_args(device_type="mps")
+    assert "--group_offload" not in s.to_args(device_type="cpu")
+    # tblr_split is unconditional -- it is what produces the -l/-r tags.
+    assert "--tblr_split" in s.to_args(device_type="mps")
+
+
+def test_group_offload_onload_device_is_rewritten(target, monkeypatch):
+    """see-through passes 'cuda' positionally as onload_device."""
+    from diffusers import ModelMixin
+
+    seen = {}
+
+    def fake(self, *args, **kwargs):
+        seen["args"], seen["kwargs"] = args, kwargs
+
+    monkeypatch.setattr(ModelMixin, "enable_group_offload", fake)
+    monkeypatch.setattr(torch_device, "_PATCHED", False)
+    torch_device.redirect_cuda_to(target)
+
+    class M(ModelMixin):
+        pass
+
+    M().enable_group_offload("cuda", num_blocks_per_group=1)
+    assert seen["args"][0] == target
+    assert seen["kwargs"]["num_blocks_per_group"] == 1
+    # pin_memory() fails on MPS, and that is the only path that calls it.
+    assert seen["kwargs"]["use_stream"] is False
+    monkeypatch.setattr(torch_device, "_PATCHED", False)
+
+
+@pytest.mark.parametrize("call", [
+    lambda m, d: m.to(device="cuda"),                  # the five layerdiff sites
+    lambda m, d: m.to("cuda"),                         # positional string
+    lambda m, d: m.to(torch.device("cuda")),           # device object
+    lambda m, d: m.to(torch.device("cuda:0")),         # indexed
+    lambda m, d: m.to(device="cuda", dtype=torch.float16),
+])
+def test_cuda_requests_are_redirected(target, call):
+    m = torch.nn.Linear(4, 4)
+    call(m, target)
+    assert m.weight.device.type == target.type
+
+
+def test_dtype_is_preserved_through_the_rewrite(target):
+    # inference_utils asks for bfloat16 in the same call as the device; losing
+    # the dtype would silently run the whole pipeline in fp32.
+    m = torch.nn.Linear(4, 4)
+    m.to(dtype=torch.bfloat16, device="cuda")
+    assert m.weight.dtype == torch.bfloat16
+    assert m.weight.device.type == target.type
+
+
+def test_cpu_placement_is_not_hijacked(target):
+    m = torch.nn.Linear(4, 4).to("cuda")
+    m.to("cpu")
+    assert m.weight.device.type == "cpu"
+    t = torch.zeros(2).to("cpu")
+    assert t.device.type == "cpu"
+
+
+def test_dtype_only_call_does_not_move_anything(target):
+    m = torch.nn.Linear(4, 4)
+    before = m.weight.device
+    m.to(torch.float64)
+    assert m.weight.dtype == torch.float64
+    assert m.weight.device == before
+
+
+def test_dot_cuda_methods_are_redirected(target):
+    assert torch.nn.Linear(4, 4).cuda().weight.device.type == target.type
+    assert torch.zeros(2).cuda().device.type == target.type
+
+
+def test_redirect_is_idempotent(monkeypatch):
+    """Double-patching would wrap the wrapper and recurse one layer per call."""
+    monkeypatch.setattr(torch.nn.Module, "to", torch.nn.Module.to)
+    monkeypatch.setattr(torch_device, "_PATCHED", False)
+    torch_device.redirect_cuda_to(torch.device("cpu"))
+    once = torch.nn.Module.to
+    torch_device.redirect_cuda_to(torch.device("cpu"))
+    assert torch.nn.Module.to is once
+    monkeypatch.setattr(torch_device, "_PATCHED", False)
+
+
+def test_redirect_to_cuda_is_a_noop(monkeypatch):
+    """On a real CUDA box nothing should be wrapped at all."""
+    monkeypatch.setattr(torch.nn.Module, "to", torch.nn.Module.to)
+    monkeypatch.setattr(torch_device, "_PATCHED", False)
+    original = torch.nn.Module.to
+    torch_device.redirect_cuda_to(torch.device("cuda"))
+    assert torch.nn.Module.to is original
+
+
+def test_describe_reports_the_device_it_was_given():
+    info = torch_device.describe(torch.device("cpu"))
+    assert info["device"] == "cpu"
+    assert info["torch"] == torch.__version__
+    assert info["group_offload_supported"] is False
+
+
+def test_resolution_cap_only_applies_to_mps():
+    # 1280 needs 25.4 GB for one attention call on MPS; CUDA has the kernels
+    # that make it cheap, so it must not be touched there.
+    assert torch_device.cap_resolution(1280, torch.device("cuda")) == (1280, None)
+    assert torch_device.cap_resolution(1280, torch.device("cpu")) == (1280, None)
+
+    capped, note = torch_device.cap_resolution(1280, torch.device("mps"))
+    assert capped == torch_device.MPS_MAX_RESOLUTION
+    assert note and "1280" in note
+
+
+def test_resolution_under_the_cap_is_left_alone():
+    for res in (512, 640, torch_device.MPS_MAX_RESOLUTION):
+        assert torch_device.cap_resolution(res, torch.device("mps")) == (res, None)
+
+
+def test_cap_rewrites_argv_and_says_so(capsys):
+    from scripts.run_seethrough import _cap_resolution_args
+
+    argv = ["x.py", "--srcp", "a.png", "--resolution", "1280",
+            "--resolution_depth", "768", "--seed", "42"]
+    _cap_resolution_args(argv, torch.device("mps"))
+    assert argv[argv.index("--resolution") + 1] == str(torch_device.MPS_MAX_RESOLUTION)
+    # 768 is already at the cap, so it stays and draws no note.
+    assert argv[argv.index("--resolution_depth") + 1] == "768"
+    assert "--seed" in argv and argv[argv.index("--seed") + 1] == "42"
+    assert "[ocs] --resolution" in capsys.readouterr().out
+
+
+def test_cap_tolerates_a_missing_or_unparseable_value(capsys):
+    from scripts.run_seethrough import _cap_resolution_args
+
+    # Trailing flag with no value, and a non-integer -- neither should raise.
+    for argv in (["x.py", "--resolution"], ["x.py", "--resolution", "auto"]):
+        before = list(argv)
+        _cap_resolution_args(argv, torch.device("mps"))
+        assert argv == before
+
+
+def test_offload_device_stays_on_cpu(target, monkeypatch):
+    """onload moves to the accelerator; offload must not follow it.
+
+    If both ended up on the same device the offloading would be a no-op, which is
+    precisely the 35 GB-footprint failure this path exists to prevent.
+    """
+    from diffusers import ModelMixin
+
+    seen = {}
+    monkeypatch.setattr(
+        ModelMixin, "enable_group_offload",
+        lambda self, *a, **k: seen.update(args=a, kwargs=k),
+    )
+    monkeypatch.setattr(torch_device, "_PATCHED", False)
+    torch_device.redirect_cuda_to(target)
+
+    class M(ModelMixin):
+        pass
+
+    M().enable_group_offload(onload_device=torch.device("cuda"),
+                             offload_device=torch.device("cpu"))
+    assert seen["kwargs"]["onload_device"] == target
+    assert seen["kwargs"]["offload_device"] == torch.device("cpu")
+    monkeypatch.setattr(torch_device, "_PATCHED", False)
+
+
+def test_redirect_accepts_a_plain_string_device(monkeypatch):
+    monkeypatch.setattr(torch.nn.Module, "to", torch.nn.Module.to)
+    monkeypatch.setattr(torch_device, "_PATCHED", False)
+    torch_device.redirect_cuda_to("cpu")          # not a torch.device
+    assert torch.nn.Linear(2, 2).to("cuda").weight.device.type == "cpu"
+    monkeypatch.setattr(torch_device, "_PATCHED", False)
