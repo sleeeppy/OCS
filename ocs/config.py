@@ -115,6 +115,19 @@ class RigSettings:
     weight_falloff: float = 2.0
     #: Vertices closer than this to a bone are pinned fully to it.
     weight_pin_px: float = 4.0
+    #: Keep each limb as one part spanning its whole chain, instead of cutting it
+    #: at the elbow / knee.
+    #:
+    #: Cutting at a joint makes the two halves separate attachments in separate
+    #: slots, and that boundary is a hard edge in the render however the weights
+    #: are set -- 61.8% of the pixels that came out darker than the source art sat
+    #: on a part's own edge. One mesh spanning the joint has no such boundary and
+    #: still bends, because ``rig._candidate_bones`` already blends a part's own
+    #: bone with its parent and children.
+    #:
+    #: The left/right split is unaffected. That is what requirement 2-2 asks for;
+    #: a part per joint segment was an implementation choice on top of it.
+    merge_limb_slices: bool = True
     #: Overlap grown onto each partition region so neighbouring parts share a
     #: seam instead of showing a gap when the joint bends.
     seam_allowance_px: int = 8

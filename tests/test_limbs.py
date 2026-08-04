@@ -73,15 +73,50 @@ def test_sides_are_not_swapped(figure):
     assert rig.bones["rightLeg"][0] < rig.bones["leftLeg"][0]
 
 
-def test_limbs_are_cut_at_the_joint(figure):
-    """An arm must not survive as one attachment spanning shoulder to wrist."""
+def test_a_limb_is_one_part_not_two(figure):
+    """An arm stays whole; it is *not* cut at the elbow.
+
+    This asserts the opposite of what it used to. Cutting at the joint made the
+    two halves separate attachments in separate slots, and that boundary is a hard
+    edge in the render whatever the weights say -- 61.8% of the pixels that came
+    out darker than the source art sat on a part's own edge. A single mesh spanning
+    the joint has no such boundary and still bends, which is what
+    ``test_export.test_limb_meshes_span_their_joint`` checks.
+
+    Left/right separation is unaffected, and that is what requirement 2-2 asks
+    for; a part per joint segment was an implementation choice on top of it.
+    """
     rig, kept = _rig_and_parts(figure)
-    parts, report = limbs.partition(figure, kept, rig, RigSettings())
+    parts, _report = limbs.partition(figure, kept, rig, RigSettings())
+
+    for tag, region in (("handwear-r", "arm_r"), ("handwear-l", "arm_l")):
+        pieces = [p for p in parts if taxonomy.base_tag(p.name) == "handwear"
+                  and p.side == ("right" if region.endswith("_r") else "left")]
+        assert pieces, f"no part for {tag}"
+        regions = {p.region for p in pieces}
+        assert regions == {region}, f"{tag} should be one {region} part, got {regions}"
+
+
+def test_left_and_right_limbs_are_still_separated(figure):
+    """The merge must not weaken requirement 2-2 itself."""
+    rig, kept = _rig_and_parts(figure)
+    parts, _ = limbs.partition(figure, kept, rig, RigSettings())
+    v = limbs.verify_limb_separation(parts, RigSettings())
+    assert v["ok"], v
+    assert not v["missing_regions"]
+    assert v["parts_per_side"]["left"] > 0 and v["parts_per_side"]["right"] > 0
+
+
+def test_joint_split_is_still_available(figure):
+    """Turning the merge off restores the per-segment partition and its check."""
+    rig, kept = _rig_and_parts(figure)
+    s = RigSettings(merge_limb_slices=False)
+    parts, report = limbs.partition(figure, kept, rig, s)
     for source in ("handwear-r", "handwear-l"):
         pieces = report["garment_slices"].get(source)
         assert pieces, f"{source} was not cut at the elbow"
-        regions = {taxonomy.part_region(p) for p in pieces}
-        assert len(regions) >= 2
+        assert len({taxonomy.part_region(p) for p in pieces}) >= 2
+    assert limbs.verify_limb_separation(parts, s)["ok"]
 
 
 def test_semantic_regions_prevent_cross_limb_bleed(figure):

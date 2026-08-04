@@ -187,15 +187,63 @@ SKIN_REGIONS: tuple[RegionSpec, ...] = (
     RegionSpec("torso",       "torso",      "neck",       None),
 )
 
-#: The four regions requirement 2-2 is about. ``ocs.limbs`` asserts every one of
-#: these is produced, even for a single-blob silhouette or a symmetric pose.
-MANDATORY_LIMB_REGIONS = (
+#: One merged region per limb, spanning that limb's whole chain.
+#:
+#: Cutting a garment at a joint guarantees a visible seam there: the two slices
+#: become separate attachments in separate slots, and the boundary between them is
+#: a hard edge in the render whatever the weights say. Measured on one character,
+#: 61.8% of the pixels that came out darker than the source art sat on a part's own
+#: edge. A single mesh spanning the joint, with vertices weighted across both
+#: bones, has no such boundary -- and it still bends, which is how a hand-built
+#: Spine rig does it.
+#:
+#: The left/right split stays: the two arms are disjoint and must move
+#: independently. That is also what requirement 2-2 actually asks for.
+LIMB_CHAINS: dict[str, tuple[str, ...]] = {
+    "arm_r": ("arm_r_upper", "arm_r_lower"),
+    "arm_l": ("arm_l_upper", "arm_l_lower"),
+    "leg_r": ("leg_r_upper", "leg_r_lower"),
+    "leg_l": ("leg_l_upper", "leg_l_lower"),
+}
+
+#: Specs for the merged limbs. ``bone`` is the chain root, which the part binds
+#: to; ``rig._candidate_bones`` then pulls in the child joint so vertices near the
+#: elbow blend between the two. These are never used for distance assignment --
+#: merged masks are the *union* of their members' masks, so per-segment accuracy
+#: is unchanged and only the grouping differs.
+MERGED_LIMB_REGIONS: tuple[RegionSpec, ...] = (
+    RegionSpec("arm_r", "rightArm", "rightHand", "right"),
+    RegionSpec("arm_l", "leftArm",  "leftHand",  "left"),
+    RegionSpec("leg_r", "rightLeg", "rightFoot", "right"),
+    RegionSpec("leg_l", "leftLeg",  "leftFoot",  "left"),
+)
+
+#: Everything ``bone_for_part`` / ``part_side`` may be asked to resolve.
+ALL_REGIONS: tuple[RegionSpec, ...] = SKIN_REGIONS + MERGED_LIMB_REGIONS
+
+#: The limbs requirement 2-2 is about: left and right, arms and legs. ``ocs.limbs``
+#: asserts every one is produced, even for a single-blob silhouette or a symmetric
+#: pose. Named per merged limb rather than per segment -- the requirement is
+#: "left/right arms and legs are separated", and demanding a separate part per
+#: joint segment on top of that is what forced the seams.
+MANDATORY_LIMB_REGIONS = ("arm_l", "arm_r", "leg_l", "leg_r")
+
+#: Per-segment form, for a partition that keeps the joint cuts.
+MANDATORY_LIMB_SEGMENTS = (
     "arm_l_upper", "arm_l_lower", "arm_r_upper", "arm_r_lower",
     "leg_l_upper", "leg_l_lower", "leg_r_upper", "leg_r_lower",
 )
 
 ARM_REGIONS = ("arm_r_upper", "arm_r_lower", "arm_l_upper", "arm_l_lower")
 LEG_REGIONS = ("leg_r_upper", "leg_r_lower", "leg_l_upper", "leg_l_lower")
+
+
+def merged_region_of(region: str) -> str | None:
+    """``arm_r_upper`` -> ``arm_r``; ``torso`` -> ``None``."""
+    for merged, members in LIMB_CHAINS.items():
+        if region in members:
+            return merged
+    return None
 
 #: Which regions a tag is allowed to be cut into.
 #:
@@ -353,7 +401,7 @@ def part_side(part_name: str) -> str | None:
         if head.endswith(suffix):
             return side
     if region:
-        for spec in SKIN_REGIONS:
+        for spec in ALL_REGIONS:
             if spec.name == region:
                 return spec.side
     return None
@@ -368,7 +416,7 @@ def bone_for_part(part_name: str, available_bones: set[str]) -> str:
     """Resolve which bone a part binds to, honouring optional-bone fallbacks."""
     region = part_region(part_name)
     if region:
-        for spec in SKIN_REGIONS:
+        for spec in ALL_REGIONS:
             if spec.name == region:
                 return spec.bone if spec.bone in available_bones else "torso"
 

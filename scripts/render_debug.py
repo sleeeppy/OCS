@@ -99,7 +99,7 @@ def main() -> int:
     else:
         rig = skeleton.guess_rig(decomp, kept)
     parts, report = limbs.partition(decomp, kept, rig, RigSettings())
-    verify = limbs.verify_limb_separation(parts)
+    verify = limbs.verify_limb_separation(parts, RigSettings())
 
     print(f"canvas     {decomp.canvas}")
     print(f"cleanup    {cleanup.summarize(reports)}  dropped={dropped}")

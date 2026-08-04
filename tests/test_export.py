@@ -95,23 +95,33 @@ def test_limb_meshes_span_their_joint(figure):
     built, _ = build(figure)
     index = {b.name: i for i, b in enumerate(built.bones)}
     checked = 0
+    # A merged limb is one mesh from shoulder to wrist, so what has to hold is
+    # that its vertices are weighted to the *joint in the middle* as well as the
+    # chain root. That is what lets it bend, and it is the whole reason the joint
+    # no longer needs a cut.
+    joint_of = {
+        "arm_r": "rightElbow", "arm_l": "leftElbow",
+        "leg_r": "rightKnee",  "leg_l": "leftKnee",
+    }
     for slot in built.slots:
         region = taxonomy.part_region(slot.part_name)
-        if region not in ("arm_r_upper", "arm_l_upper", "leg_r_upper", "leg_l_upper"):
+        if region not in joint_of:
             continue
         att = built.attachments[slot.attachment]
         if att.kind != "mesh":
             continue
 
-        tag = taxonomy.base_tag(slot.part_name)
-        lower = region.replace("_upper", "_lower")
-        allowed = taxonomy.allowed_regions(tag, taxonomy.part_side(slot.part_name))
-        if allowed is not None and lower not in allowed:
-            continue                      # this tag legitimately stops at the joint
-
-        child = next(s for s in taxonomy.SKIN_REGIONS if s.name == region).to_bone
-        if child in index:
-            assert index[child] in att.bones_used, f"{slot.name} is not weighted to {child}"
+        # A tag that only reaches part of the limb is never merged (see
+        # Partition._merge_key), so anything that got a merged region does span it.
+        root = next(s for s in taxonomy.MERGED_LIMB_REGIONS if s.name == region).bone
+        joint = joint_of[region]
+        if root in index:
+            assert index[root] in att.bones_used, f"{slot.name} is not weighted to {root}"
+        if joint in index:
+            assert index[joint] in att.bones_used, (
+                f"{slot.name} spans {region} but is not weighted to {joint}, "
+                "so the joint cannot bend"
+            )
             checked += 1
     assert checked, "no limb meshes were checked -- fixture or taxonomy changed"
 

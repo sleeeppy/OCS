@@ -360,7 +360,7 @@ def preview_partition(project: Project) -> dict:
     return {
         "regions": [s.name for s in specs],
         "report": report,
-        "verify": limbs.verify_limb_separation(_new_parts),
+        "verify": limbs.verify_limb_separation(_new_parts, project.settings().rig),
         "part_count": len(_new_parts),
     }
 
@@ -383,7 +383,7 @@ def run_export(project: Project, on_progress=None) -> dict:
 
     step("separating limbs", 0.20)
     parts, limb_report = limbs.partition(decomp, kept, rig, s.rig)
-    verify = limbs.verify_limb_separation(parts)
+    verify = limbs.verify_limb_separation(parts, s.rig)
 
     step("building meshes and weights", 0.45)
     built = rig_mod.build_rig(decomp, parts, rig, s.rig)
