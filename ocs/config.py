@@ -167,6 +167,20 @@ class RigSettings:
     #: behind it holding see-through's drifted colour -- a dark line along every
     #: outline. See ``rig.restore_source_pixels``.
     source_pixel_claim_floor: int = 250
+    #: Restore the opacity the layer split lost, where the artwork was opaque.
+    #:
+    #: Splitting one antialiased image into layers halves the alpha at every
+    #: internal boundary, so ``collar over sleeve`` composites to 0.75 where the
+    #: artwork was 1.0 and the background shows through the difference. That is the
+    #: dark hairline. See ``rig.restore_source_alpha``.
+    restore_source_alpha: bool = True
+    #: How opaque the *artwork* must be before its alpha is treated as solid and
+    #: copied back. High, so the character's own soft outline -- legitimately
+    #: semi-transparent -- keeps its feathering instead of gaining a hard fringe.
+    source_alpha_solid_floor: int = 250
+    #: How much alpha a part must already have at a pixel before it may be raised.
+    #: Above zero so a part is never grown into territory it does not cover.
+    source_alpha_touch_floor: int = 8
 
 
 @dataclass

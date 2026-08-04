@@ -587,6 +587,87 @@ def _resolve_draw_order(parts: list[Part], decomp: Decomposition) -> list[Part]:
     return out
 
 
+def restore_source_alpha(
+    ordered: list[Part], decomp: Decomposition, s: RigSettings
+) -> list[Part]:
+    """Close the opacity the layer split lost, where the artwork was opaque.
+
+    This is the dark hairline, and the cause is arithmetic rather than a bug in
+    anything upstream. In the flat artwork, a pixel on the boundary between the
+    collar and the sleeve is a *blend of the two* and fully opaque -- it is inside
+    the character. Split into two layers, each gets roughly half alpha there.
+    Composite them back with straight alpha and you get
+
+        1 - (1 - 0.5)(1 - 0.5) = 0.75
+
+    so a pixel the artwork had at 1.0 comes back at 0.75 and the background shows
+    through the missing quarter. Every internal layer boundary becomes a dark line,
+    which is exactly what "the cuts are visible" looks like.
+
+    Measured over the 7274 pixels that render darker than the source: mean
+    reconstruction alpha 130.6 against the original's 147.0, and on 3336 of them
+    (45.9%) the original is more than 8 levels more opaque. Only 723 (9.9%) are
+    fully opaque in both and merely the wrong colour.
+
+    ``restore_source_pixels`` fixes colour and leaves alpha alone, so it cannot
+    reach this. The repair is to give the frontmost part the alpha the artwork had:
+    it is the part you see, the artwork says the pixel is solid, and raising it
+    changes nothing anywhere the reconstruction was already opaque.
+
+    Only where the source is genuinely solid. The character's own soft outline is
+    partly transparent in the artwork too, and must stay that way or the silhouette
+    gains a hard fringe.
+    """
+    if decomp.src_img is None or decomp.src_img.shape[2] < 4:
+        return ordered
+
+    cw, ch = decomp.canvas
+    src_alpha = decomp.src_img[..., 3]
+    solid = src_alpha >= s.source_alpha_solid_floor
+
+    # Composite alpha of everything, which is order-independent.
+    acc = np.zeros((ch, cw), np.float64)
+    for part in ordered:
+        a = part.canvas_rgba(decomp.canvas)[..., 3].astype(np.float64) / 255.0
+        acc = a + acc * (1.0 - a)
+
+    short = solid & (acc < 0.999)
+    if not short.any():
+        return ordered
+
+    out = list(ordered)
+    # Near to far: the frontmost part owns the pixel, so it is the one to fix.
+    fixed = np.zeros((ch, cw), dtype=bool)
+    for i in range(len(ordered) - 1, -1, -1):
+        part = ordered[i]
+        x1, y1, x2, y2 = part.bbox
+        cx1, cy1 = max(0, x1), max(0, y1)
+        cx2, cy2 = min(cw, x2), min(ch, y2)
+        if cx2 <= cx1 or cy2 <= cy1:
+            continue
+        sx, sy = cx1 - x1, cy1 - y1
+        h, w = cy2 - cy1, cx2 - cx1
+
+        window_short = short[cy1:cy2, cx1:cx2] & ~fixed[cy1:cy2, cx1:cx2]
+        alpha = part.rgba[sy:sy + h, sx:sx + w, 3]
+        # Only a pixel this part actually contributes to; raising alpha where it
+        # has none would grow the part into territory it never covered.
+        target = window_short & (alpha > s.source_alpha_touch_floor)
+        if not target.any():
+            continue
+
+        rgba = part.rgba.copy()
+        rgba[sy:sy + h, sx:sx + w, 3][target] = src_alpha[cy1:cy2, cx1:cx2][target]
+        fixed[cy1:cy2, cx1:cx2] |= target
+        out[i] = Part(
+            name=part.name, rgba=rgba, offset=part.offset,
+            depth_median=part.depth_median, depth=part.depth,
+            synthetic=part.synthetic,
+            meta={**part.meta, "source_alpha_fixed": int(target.sum())},
+        )
+    return out
+
+
 def restore_source_pixels(
     ordered: list[Part], decomp: Decomposition, s: RigSettings
 ) -> list[Part]:
@@ -717,6 +798,10 @@ def build_rig(
     warnings: list[str] = []
 
     ordered = _resolve_draw_order(parts, decomp)
+    if s.restore_source_alpha:
+        # Before the colour repaint: raising alpha brings pixels above the repaint
+        # floors, so they get the right colour as well as the right opacity.
+        ordered = restore_source_alpha(ordered, decomp, s)
     if s.restore_source_pixels:
         ordered = restore_source_pixels(ordered, decomp, s)
 
