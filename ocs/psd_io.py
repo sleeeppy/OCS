@@ -320,8 +320,17 @@ def read_layer_dir(layer_dir: str | Path) -> Decomposition:
         src_img = np.array(Image.open(src_p).convert("RGBA"))
 
     #: see-through's inputs, which live in the same directory as its outputs.
-    inputs = {"src_img", "src_head"}
-    files = sorted(p for p in layer_dir.glob("*.png") if p.stem not in inputs)
+    # Not every PNG in here is an output layer. ``src_img`` and ``src_head`` are
+    # see-through's own inputs, and ``head`` is the intermediate crop the second
+    # pass runs on -- it is in BODY_PASS_TAGS but deliberately not in PART_TAGS, and
+    # ``further_extr`` never puts it in the PSD. Importing it anyway gave a
+    # whole-head rigid quad with no entry in TAG_TO_BONE, so it bound to ``torso``
+    # and rode the trunk instead of the head.
+    files = sorted(
+        p for p in layer_dir.glob("*.png")
+        if p.stem in taxonomy.PART_TAGS
+        or taxonomy.base_tag(p.stem) in taxonomy.PART_TAGS
+    )
     if not files:
         raise FileNotFoundError(f"no layer PNGs in {layer_dir}")
 

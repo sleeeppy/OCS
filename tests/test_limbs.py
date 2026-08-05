@@ -199,3 +199,24 @@ def test_reslicing_keeps_the_left_right_suffix():
     assert twice == "legwear-l@leg_l"
     assert taxonomy.part_side(twice) == "left"
     assert taxonomy.base_tag(twice) == "legwear"
+
+
+def test_layer_dir_skips_see_throughs_intermediates(tmp_path):
+    """``head.png`` is a crop the second pass runs on, not an output layer.
+
+    It is in BODY_PASS_TAGS but deliberately absent from PART_TAGS, and
+    ``further_extr`` never puts it in the PSD. read_layer_dir imported every PNG,
+    so the recovery path picked it up -- and with no TAG_TO_BONE entry it bound to
+    ``torso``, giving a whole-head rigid quad riding the trunk.
+    """
+    import numpy as np
+    from PIL import Image
+    from ocs import psd_io
+
+    for stem in ("src_img", "src_head", "head", "face", "topwear"):
+        a = np.zeros((32, 32, 4), np.uint8)
+        a[8:24, 8:24] = (200, 180, 170, 255)
+        Image.fromarray(a).save(tmp_path / f"{stem}.png")
+
+    names = {q.name for q in psd_io.read_layer_dir(tmp_path).parts}
+    assert names == {"face", "topwear"}, names
