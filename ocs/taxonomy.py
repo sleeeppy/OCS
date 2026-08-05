@@ -385,6 +385,15 @@ def slugify(name: str) -> str:
     return _SLUG_RE.sub("_", name).strip("_").lower()
 
 
+def base_tag_with_side(part_name: str) -> str:
+    """Drop only the region suffix: ``legwear-l@leg_l_upper`` -> ``legwear-l``.
+
+    The LR suffix has to survive -- it is what ``part_side`` reads for a layer
+    see-through split itself.
+    """
+    return part_name.split(REGION_SEP, 1)[0]
+
+
 def base_tag(part_name: str) -> str:
     """Strip LR suffix and region suffix: ``legwear-l@leg_l_upper`` -> ``legwear``."""
     name = part_name.split(REGION_SEP, 1)[0]
@@ -452,7 +461,19 @@ class PartNaming:
         return f"{self.skin_prefix}{REGION_SEP}{region}"
 
     def garment(self, tag: str, region: str) -> str:
-        return f"{tag}{REGION_SEP}{region}"
+        """``tag@region``, **replacing** any region the name already carries.
+
+        A part can be cut twice: ``_slice_by_regions`` assigns one, and then
+        ``enforce_limb_coverage`` may carve a mandatory region out of the result.
+        Appending gave ``bottomwear@leg_r_upper@leg_r``, and everything that reads
+        a region splits on the *first* separator, so that name resolved to the
+        region ``leg_r_upper@leg_r`` -- which matches no spec. The consequences are
+        silent and severe: ``part_side`` returns ``None`` so the piece vanishes
+        from the left/right tally, and ``bone_for_part`` falls back to ``torso``,
+        binding a piece of skirt lying over the shin to the *trunk*. It then slides
+        across the leg whenever the torso moves.
+        """
+        return f"{base_tag_with_side(tag)}{REGION_SEP}{region}"
 
     def unique_slug(self, part_name: str) -> str:
         slug = slugify(part_name)

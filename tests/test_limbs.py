@@ -166,3 +166,36 @@ def test_region_labels_only_inside_the_silhouette(figure):
     assert len(specs) == len(taxonomy.SKIN_REGIONS)
     assert (labels[~sil] == limbs.UNASSIGNED).all()
     assert (labels[sil] >= 0).all()
+
+
+def test_reslicing_replaces_the_region_instead_of_appending():
+    """A part can be cut twice, and the second cut must not stack suffixes.
+
+    _slice_by_regions assigns a region, then enforce_limb_coverage may carve a
+    mandatory region out of the result. Appending produced
+    ``bottomwear@leg_r_upper@leg_r``, and every reader splits on the *first*
+    separator, so the region became ``leg_r_upper@leg_r`` -- matching no spec.
+    The damage is silent: part_side goes None so the piece drops out of the
+    left/right tally, and bone_for_part falls back to torso, binding a piece of
+    skirt lying over the shin to the trunk so it slides across the leg whenever
+    the torso moves.
+    """
+    naming = taxonomy.PartNaming()
+    once = naming.garment("bottomwear", "leg_r_upper")
+    twice = naming.garment(once, "leg_r")
+
+    assert twice.count(taxonomy.REGION_SEP) == 1, twice
+    assert taxonomy.part_region(twice) == "leg_r"
+    assert taxonomy.part_side(twice) == "right"
+
+    bones = {b.name for b in taxonomy.BONE_TEMPLATE}
+    assert taxonomy.bone_for_part(twice, bones) == "rightLeg"
+
+
+def test_reslicing_keeps_the_left_right_suffix():
+    """The LR suffix is what part_side reads for a layer see-through split."""
+    naming = taxonomy.PartNaming()
+    twice = naming.garment(naming.garment("legwear-l", "leg_l_upper"), "leg_l")
+    assert twice == "legwear-l@leg_l"
+    assert taxonomy.part_side(twice) == "left"
+    assert taxonomy.base_tag(twice) == "legwear"
