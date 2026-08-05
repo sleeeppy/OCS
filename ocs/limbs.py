@@ -470,7 +470,7 @@ def partition(
     for part in parts:
         tag = part.tag
 
-        if tag in taxonomy.OCS_LR_TAGS and part.side is None and tag not in already_split:
+        if tag in taxonomy.PAIRED_LR_TAGS and part.side is None and tag not in already_split:
             pieces = split_lr(part, decomp, rig, grid, s.min_slice_fraction)
             if len(pieces) > 1:
                 report["lr_split"].append(part.name)

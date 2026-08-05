@@ -70,6 +70,22 @@ OCS_LR_TAGS = (
     "legwear", "footwear",
 )
 
+#: Every tag that is two things, whichever side of the pipeline splits it.
+#:
+#: Whether ``handwear`` arrives split is a property of the *run*, not the tag:
+#: ``--tblr_split`` is applied by ``further_extr``, which is the last thing an
+#: inference does, so an interrupted run yields both sleeves in one layer. Keying
+#: the decision off ``OCS_LR_TAGS`` alone then leaves it unsplit, and the bone
+#: partition cuts it per pixel by nearest segment instead of by connected
+#: component. On a pose with one arm folded to the chin that assigns the *right*
+#: sleeve's drape to the left arm -- it is genuinely nearer the left arm's segment,
+#: which runs all the way down to the hand -- and the drape renders as a detached
+#: strip lying across the leg.
+#:
+#: So the test is the data, not the tag list: a paired tag with no side suffix
+#: still needs splitting, no matter who was supposed to have done it.
+PAIRED_LR_TAGS = OCS_LR_TAGS + UPSTREAM_LR_TAGS
+
 #: Layers that span more than one bone and must be cut by the bone partition.
 #:
 #: ``handwear`` and ``legwear`` are in here because their names are misleading.

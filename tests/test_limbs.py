@@ -220,3 +220,29 @@ def test_layer_dir_skips_see_throughs_intermediates(tmp_path):
 
     names = {q.name for q in psd_io.read_layer_dir(tmp_path).parts}
     assert names == {"face", "topwear"}, names
+
+
+def test_a_paired_tag_arriving_unsplit_is_still_split():
+    """Whether handwear arrives split is a property of the run, not the tag.
+
+    --tblr_split is applied by further_extr, the last step of an inference, so an
+    interrupted run yields both sleeves in one layer. Keying the decision off
+    OCS_LR_TAGS alone left it whole, and the bone partition then cut it per pixel
+    by nearest segment rather than by connected component -- which, on a pose with
+    one arm folded to the chin, handed the right sleeve's drape to the *left* arm
+    (genuinely nearer that segment, which runs down to the hand) and rendered it
+    as a detached strip lying across the leg.
+    """
+    assert "handwear" in taxonomy.PAIRED_LR_TAGS
+    assert "handwear" not in taxonomy.OCS_LR_TAGS, "upstream normally splits it"
+    # Everything either side of the pipeline may split is covered.
+    for tag in taxonomy.OCS_LR_TAGS + taxonomy.UPSTREAM_LR_TAGS:
+        assert tag in taxonomy.PAIRED_LR_TAGS, tag
+
+
+def test_already_split_layers_are_left_alone(figure):
+    """When upstream did split, the side suffix is present and OCS must not redo it."""
+    rig, kept = _rig_and_parts(figure)
+    assert any(p.tag == "handwear" and p.side for p in kept), "fixture is pre-split"
+    _parts, report = limbs.partition(figure, kept, rig, RigSettings())
+    assert "handwear" not in report["lr_split"]
