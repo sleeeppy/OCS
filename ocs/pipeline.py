@@ -296,6 +296,27 @@ def load_rig(project: Project) -> skeleton.Rig:
     return skeleton.Rig.from_dict(json.loads(project.rig_path.read_text(encoding="utf-8")))
 
 
+def _apply_upscale(project: Project, decomp: psd_io.Decomposition) -> psd_io.Decomposition:
+    """Re-express the decomposition at the original artwork's resolution.
+
+    see-through infers at a reduced resolution, so its layers -- and every pixel
+    ``restore_source_pixels`` copies back from them -- are softer than the source.
+    A project that recorded an ``upscale_source`` keeps the model's shapes and
+    takes its pixels from the full-size art instead. Re-applied on every load
+    because the layers on disk are still the small ones.
+    """
+    rel = project.state.get("upscale_source")
+    if not rel:
+        return decomp
+    path = project.root / rel
+    if not path.exists():
+        return decomp
+    import numpy as np
+    from PIL import Image as _Image
+    return psd_io.upscale_decomposition(
+        decomp, np.array(_Image.open(path).convert("RGBA")))
+
+
 def load_decomposition(project: Project) -> psd_io.Decomposition:
     """The project's layers, from wherever this project keeps them.
 
@@ -306,12 +327,13 @@ def load_decomposition(project: Project) -> psd_io.Decomposition:
     """
     stored = project.state.get("psd")
     if stored:
-        return psd_io.read_decomposition(project.root / stored)
+        return _apply_upscale(project, psd_io.read_decomposition(project.root / stored))
 
     # A run interrupted before further_extr has the layer PNGs but no PSD.
     layer_dir = project.state.get("layer_dir")
     if layer_dir:
-        return psd_io.read_layer_dir(project.root / layer_dir)
+        decomp = psd_io.read_layer_dir(project.root / layer_dir)
+        return _apply_upscale(project, decomp)
 
     figure = project.state.get("demo")
     if figure:
@@ -397,7 +419,9 @@ def run_export(project: Project, on_progress=None) -> dict:
 
     step("writing skeleton.json", 0.85)
     json_path = spine_export.export_skeleton(
-        built, project.export_dir / "skeleton.json", name=project.state.get("name", "character")
+        built, project.export_dir / "skeleton.json",
+        name=project.state.get("name", "character"),
+        animations=list(s.rig.animations) if s.rig.animations else None,
     )
     doc = json.loads(json_path.read_text(encoding="utf-8"))
     problems = spine_export.validate(doc)

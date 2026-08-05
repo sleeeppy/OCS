@@ -128,6 +128,15 @@ class RigSettings:
     #: The left/right split is unaffected. That is what requirement 2-2 asks for;
     #: a part per joint segment was an implementation choice on top of it.
     merge_limb_slices: bool = True
+    #: How much of the silhouette the *other* layers may cover before a big layer
+    #: stops counting as "the only layer" and keeps its tag restriction.
+    #:
+    #: The escape exists so a lone head-to-toe ``topwear`` can be cut into legs.
+    #: Size alone does not establish loneness: on a seated figure a spread skirt
+    #: covers 73.5% of the silhouette while the other layers still cover 49.8%, and
+    #: releasing it let ``bottomwear`` claim the arm the sleeve already had. A
+    #: genuinely lone layer has others at ~0. See ``limbs._slice_by_regions``.
+    lone_layer_others_max: float = 0.25
     #: Overlap grown onto each partition region so neighbouring parts share a
     #: seam instead of showing a gap when the joint bends.
     seam_allowance_px: int = 8
@@ -191,6 +200,16 @@ class RigSettings:
     #: How much alpha a part must already have at a pixel before it may be raised.
     #: Above zero so a part is never grown into territory it does not cover.
     source_alpha_touch_floor: int = 8
+
+
+    #: Which preset animations to emit, or ``None`` for all of them.
+    #:
+    #: The presets assume a standing figure. On a seated character ``walk`` and
+    #: ``jump`` are not merely unflattering, they are meaningless -- there is no
+    #: stride to take -- and ``limb_swing_caps`` correctly shrinks them to almost
+    #: nothing, which leaves the player listing animations that do not move.
+    #: Naming the useful subset is better than shipping dead entries.
+    animations: tuple[str, ...] | None = None
 
 
 @dataclass

@@ -476,13 +476,19 @@ def partition(
                 report["lr_split"].append(part.name)
                 # A trouser leg still spans hip and knee; keep cutting it.
                 for piece in pieces:
-                    result.extend(_slice_by_regions(piece, decomp, grid, s, report))
+                    result.extend(
+                        _slice_by_regions(piece, decomp, grid, s, report,
+                                          _union_of_others(part, parts, decomp))
+                    )
                 continue
             result.append(part)
             continue
 
         if tag in taxonomy.LIMB_SPANNING_TAGS:
-            result.extend(_slice_by_regions(part, decomp, grid, s, report))
+            result.extend(
+                _slice_by_regions(part, decomp, grid, s, report,
+                                  _union_of_others(part, parts, decomp))
+            )
             continue
 
         result.append(part)
@@ -492,12 +498,26 @@ def partition(
     return result, report
 
 
+def _union_of_others(part: Part, parts: list[Part], decomp: Decomposition) -> np.ndarray:
+    """Everything except ``part``, as one mask.
+
+    Used to test whether a large layer is genuinely the only one -- the condition
+    the tag-restriction escape in ``_slice_by_regions`` is meant to detect.
+    """
+    out = np.zeros(decomp.canvas[::-1], dtype=bool)
+    for q in parts:
+        if q is not part:
+            out |= q.canvas_mask(decomp.canvas)
+    return out
+
+
 def _slice_by_regions(
     part: Part,
     decomp: Decomposition,
     grid: Partition,
     s: RigSettings,
     report: dict,
+    others: np.ndarray | None = None,
 ) -> list[Part]:
     """Cut a limb-spanning layer at its joints, within the regions its tag allows.
 
@@ -517,9 +537,18 @@ def _slice_by_regions(
     # leaves the legs uncuttable. The tag restriction exists to stop *one layer
     # among many* from claiming another limb's geometry, which cannot apply when
     # there is no other layer to claim it.
+    #
+    # Size alone does not establish that, though, and on a seated figure it is
+    # actively wrong: a spread skirt covers 73.5% of the silhouette while the other
+    # layers still cover 49.8% of it, so ``bottomwear`` was released from its tag
+    # restriction and claimed the arm the sleeve was already covering. The
+    # condition the comment above actually describes is *no other layer*, so test
+    # that directly -- for a genuinely lone layer the others cover nothing.
     silhouette_px = int(grid.silhouette.sum())
     if silhouette_px and total >= 0.55 * silhouette_px:
-        allowed = None
+        others_frac = 0.0 if others is None else float(others.sum()) / silhouette_px
+        if others_frac < s.lone_layer_others_max:
+            allowed = None
 
     masks = grid.masks(allowed, seam_px=s.seam_allowance_px, within=mask,
                        merge_limbs=s.merge_limb_slices)

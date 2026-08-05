@@ -52,6 +52,9 @@ def main() -> int:
     ap.add_argument("src", type=Path,
                     help="see-through PSD, or its per-tag layer directory")
     ap.add_argument("--name", default=None, help="project name (defaults to the stem)")
+    ap.add_argument("--source", type=Path, default=None,
+                    help="original artwork; re-express the decomposition at its "
+                         "resolution so parts are repainted from the full-size art")
     args = ap.parse_args()
 
     src = args.src.resolve()
@@ -86,6 +89,13 @@ def main() -> int:
         psd_rel = str((root / "seethrough" / src.name).relative_to(root))
         layer_dir_rel = None
 
+    if args.source:
+        import numpy as np
+        before = decomp.canvas
+        decomp = psd_io.upscale_decomposition(
+            decomp, np.array(Image.open(args.source).convert("RGBA")))
+        print(f"upscaled {before[0]} -> {decomp.canvas[0]} from {args.source.name}")
+
     print(f"canvas {decomp.canvas}, {len(decomp.parts)} layers")
 
     if decomp.src_img is not None:
@@ -114,6 +124,7 @@ def main() -> int:
                   "height": decomp.canvas[1], "had_alpha": None},
         "psd": psd_rel,
         "layer_dir": layer_dir_rel,
+        "upscale_source": "input.png" if args.source else None,
         "canvas": {"width": decomp.canvas[0], "height": decomp.canvas[1]},
         "layers": [{**r.to_dict(), **layer_info.get(r.name, {})} for r in reports],
         "cleanup_summary": cleanup.summarize(reports),
