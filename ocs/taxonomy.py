@@ -346,6 +346,12 @@ TAG_TO_BONE = {
 DRAW_AFTER: dict[str, tuple[str, ...]] = {
     "headwear": ("front hair", "back hair"),
     "front hair": ("face", "ears", "earwear", "neck"),
+    # Back hair is behind the head by definition. Stated because the overlap
+    # inference cannot tell: see-through inpaints the hidden part of the hair, so
+    # over the face the two layers agree and the comparison is a coin toss -- and
+    # it landed on hair-over-face.
+    "face": ("back hair",),
+    "ears": ("back hair",),
     "eyewhite": ("face",),
     "irides": ("face", "eyewhite"),
     "eyelash": ("face", "eyewhite", "irides"),

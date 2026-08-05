@@ -516,6 +516,66 @@ def _region_attachment(
 # --------------------------------------------------------------------------
 
 
+def infer_overlap_order(
+    parts: list[Part], decomp: Decomposition, min_overlap: int = 400,
+    min_margin: float = 8.0,
+) -> list[tuple[Part, Part]]:
+    """Ask the artwork which of two overlapping layers is in front.
+
+    Only used when there is no depth to rank by. see-through's depth comes from
+    ``apply_marigold``, which runs after the layer pass, so a run interrupted in
+    between yields layers with no depth at all -- every ``depth_median`` is the
+    same 1.0 default and the order collapses onto ``taxonomy.Z_PRIOR``, a table
+    written for a standing figure. On a seated one that is wrong in a way you
+    cannot miss: ``legwear`` sorts to -12 and ``bottomwear`` to -10, so a raised
+    bare leg is drawn *behind* the skirt it is plainly in front of.
+
+    The artwork settles it without any model. Where two layers overlap, only the
+    front one is visible, so only the front one matches the source there. Measured
+    on this character, mean absolute RGB error over the shared opaque pixels:
+
+        legwear / bottomwear    21680 px      8.3  vs  120.2   -> legwear
+        footwear / bottomwear    7567 px     10.1  vs   67.2   -> footwear
+        bottomwear / handwear   97885 px     85.2  vs   34.0   -> handwear
+        topwear / handwear      34086 px     82.2  vs   15.7   -> handwear
+
+    Margins like that are not close calls. ``min_margin`` ignores the ones that
+    are, so a genuinely ambiguous pair keeps whatever order it already had.
+
+    Returns ``(front, back)`` pairs for the topological sort to consume.
+    """
+    if decomp.src_img is None or decomp.src_img.shape[2] < 4:
+        return []
+    depths = {round(p.depth_median, 6) for p in parts}
+    if len(depths) > 1:
+        return []          # a real depth pass ran; trust it
+
+    src = decomp.src_img[..., :3].astype(np.float32)
+    cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+    def solid_rgb(p: Part):
+        if p.name not in cache:
+            blk = p.canvas_rgba(decomp.canvas)
+            cache[p.name] = (blk[..., 3] > 200, blk[..., :3].astype(np.float32))
+        return cache[p.name]
+
+    out: list[tuple[Part, Part]] = []
+    for i, a in enumerate(parts):
+        ma, ra = solid_rgb(a)
+        for b in parts[i + 1:]:
+            mb, rb = solid_rgb(b)
+            ov = ma & mb
+            n = int(ov.sum())
+            if n < min_overlap:
+                continue
+            ea = float(np.abs(ra[ov] - src[ov]).mean())
+            eb = float(np.abs(rb[ov] - src[ov]).mean())
+            if abs(ea - eb) < min_margin:
+                continue
+            out.append((a, b) if ea < eb else (b, a))
+    return out
+
+
 def _resolve_draw_order(parts: list[Part], decomp: Decomposition) -> list[Part]:
     """Far-to-near order: see-through's depth, corrected where it is provably wrong.
 
@@ -553,18 +613,47 @@ def _resolve_draw_order(parts: list[Part], decomp: Decomposition) -> list[Part]:
     successors: dict[str, list[str]] = {p.name: [] for p in parts}
     indegree: dict[str, int] = {p.name: 0 for p in parts}
 
+    def constrain(front: Part, back: Part) -> bool:
+        a, b = mask_of(front), mask_of(back)
+        inter = int((a & b).sum())
+        smaller = min(int(a.sum()), int(b.sum()))
+        if smaller == 0 or inter < 0.05 * smaller:
+            return False  # they do not really overlap; order is irrelevant
+        successors[back.name].append(front.name)
+        indegree[front.name] += 1
+        return True
+
     for p in parts:
         for blocker_tag in taxonomy.DRAW_AFTER.get(p.tag, ()):
             for blocker in by_tag.get(blocker_tag, ()):
-                if blocker.name == p.name:
-                    continue
-                a, b = mask_of(p), mask_of(blocker)
-                inter = int((a & b).sum())
-                smaller = min(int(a.sum()), int(b.sum()))
-                if smaller == 0 or inter < 0.05 * smaller:
-                    continue  # they do not really overlap; order is irrelevant
-                successors[blocker.name].append(p.name)
-                indegree[p.name] += 1
+                if blocker.name != p.name:
+                    constrain(p, blocker)
+
+    # Inferred edges are advisory and go in second, because they are read off the
+    # artwork and can be wrong where a layer was inpainted to look like what is on
+    # top of it -- measured here, the overlap test claimed ``face`` was in front of
+    # ``eyewhite``, the exact reverse of what DRAW_AFTER states. Contradicting a
+    # curated edge creates a cycle, and a cycle makes the whole sort fall back, so
+    # a single bad guess used to discard every good one with it. Now the curated
+    # table wins and anything that would close a loop is dropped.
+    def would_cycle(front: str, back: str) -> bool:
+        stack, seen = [front], {front}
+        while stack:
+            n = stack.pop()
+            if n == back:
+                return True
+            for nxt in successors[n]:
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        return False
+
+    for front, back in infer_overlap_order(parts, decomp):
+        if front.name in successors[back.name]:
+            continue                       # already stated
+        if would_cycle(front.name, back.name):
+            continue
+        constrain(front, back)
 
     if not any(indegree.values()):
         return fallback

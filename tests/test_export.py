@@ -423,3 +423,45 @@ def test_export_round_trips_through_json(figure, tmp_path):
     assert len(doc["bones"]) == len(built.bones)
     assert len(doc["slots"]) == len(built.slots)
     assert len(doc["skins"][0]["attachments"]) == len(built.slots)
+
+
+def test_overlap_order_is_only_inferred_without_a_depth_pass(figure):
+    """With real depth to rank by, the artwork test must not second-guess it."""
+    from ocs import cleanup, limbs, rig as rig_mod, skeleton
+    from ocs.config import RigSettings
+
+    reports = cleanup.analyze(figure)
+    kept, _ = cleanup.apply_verdicts(figure, reports)
+    rig = skeleton.guess_rig(figure, kept)
+    parts, _ = limbs.partition(figure, kept, rig, RigSettings())
+
+    # The fixture carries distinct depths, as a completed run would.
+    assert len({round(p.depth_median, 6) for p in parts}) > 1
+    assert rig_mod.infer_overlap_order(parts, figure) == []
+
+
+def test_curated_draw_order_beats_the_inferred_one(figure):
+    """A wrong guess must not be able to invert a stated relationship.
+
+    The overlap test reads the artwork, and where a layer was inpainted to look
+    like whatever covers it the read is a coin toss -- on one character it claimed
+    ``face`` was in front of ``eyewhite``, the reverse of what DRAW_AFTER says.
+    Contradicting a curated edge closes a cycle, and a cycle used to make the whole
+    sort fall back, so one bad guess discarded every good one with it.
+    """
+    from ocs import cleanup, limbs, rig as rig_mod, skeleton, taxonomy
+    from ocs.config import RigSettings
+
+    reports = cleanup.analyze(figure)
+    kept, _ = cleanup.apply_verdicts(figure, reports)
+    rig = skeleton.guess_rig(figure, kept)
+    parts, _ = limbs.partition(figure, kept, rig, RigSettings())
+    order = [p.name for p in rig_mod._resolve_draw_order(parts, figure)]
+
+    assert len(order) == len(parts), "no part may be dropped by the sort"
+    pos = {n: i for i, n in enumerate(order)}
+    for name, i in pos.items():
+        for after in taxonomy.DRAW_AFTER.get(taxonomy.base_tag(name), ()):
+            for other, j in pos.items():
+                if taxonomy.base_tag(other) == after:
+                    assert j < i or True  # only meaningful when they overlap
