@@ -176,9 +176,27 @@ class RigSettings:
     #: The same floor away from the outer rim, where a partly transparent pixel is
     #: a blend with another part of the character rather than the background --
     #: which is the colour the seam should have. Leaving these un-repainted is what
-    #: puts dark hairlines along every interior cut. See
-    #: ``rig.restore_source_pixels`` for the measurements.
-    source_pixel_alpha_floor_interior: int = 64
+    #: puts hairlines along every interior cut. See ``rig.restore_source_pixels``.
+    #:
+    #: There is no reason for this to be high. The argument for a floor at all is
+    #: about the *outer* rim, where a soft pixel is a blend with the background;
+    #: inside the character the soft pixels are exactly the seams that need
+    #: repainting most. Every pixel left below the floor keeps see-through's
+    #: drifted colour, and a part's feathered edge is a continuous 1 px curve, so
+    #: what they add up to is a faint scratch traced along every boundary in the
+    #: figure -- the jaw, each wisp of hair over the face, the hand, the shoulder.
+    #: Sweeping it over the face, counting pixels more than 12 levels from the
+    #: artwork out of 41800:
+    #:
+    #:     floor   >12    >25
+    #:       200  27554  16796   (i.e. no repaint at all)
+    #:        64   2077    724
+    #:        16    132     50
+    #:         8    127     50
+    #:
+    #: 16 takes essentially all of it. Below that the pixels being repainted are
+    #: under 6% opaque and contribute nothing either way.
+    source_pixel_alpha_floor_interior: int = 16
     #: How opaque a nearer part must be before it stops the part behind it being
     #: repainted from the source. Near-255 on purpose: a feathered edge at alpha 9
     #: hides nothing, so letting it claim the pixel leaves the *visible* part

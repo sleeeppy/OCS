@@ -699,3 +699,73 @@ def test_parts_that_meet_agree_on_where_they_are_going(figure):
     assert checked > 0, "fixture should have parts that meet along a seam"
     assert worst < 0.02, (
         f"{where} disagree by {worst:.3f} at a shared vertex, so the seam tears")
+
+
+def test_a_feathered_edge_inside_the_figure_is_repainted():
+    """Soft pixels inside the character must get the artwork's colour.
+
+    ``restore_source_pixels`` skips anything below its alpha floor, and those
+    pixels keep see-through's drifted colour. A part's feathered edge is a
+    continuous 1 px curve, so what they add up to is a faint scratch traced along
+    every boundary in the figure -- over one face: the jaw, each wisp of hair
+    across the cheek, the hand, the shoulder.
+
+    The floor is only justified at the *outer* rim, where a soft artwork pixel is
+    a blend with the background and copying it drags background colour inward.
+    Inside the silhouette the soft pixels are the seams, which is exactly what
+    needs repainting. Sweeping the interior floor over that face, counting pixels
+    more than 12 levels from the artwork out of 41800: 2077 at 64, 132 at 16.
+    """
+    import numpy as np
+
+    from ocs import rig as rig_mod
+    from ocs.config import RigSettings as RS
+    from ocs.psd_io import Decomposition, Part
+
+    # A part with a feathered edge lying over a bigger one, inside a solid
+    # artwork -- an interior boundary, nowhere near the silhouette.
+    behind = np.zeros((200, 200, 4), np.uint8)
+    behind[20:180, 20:180] = (180, 60, 60, 255)
+    front = np.zeros((200, 200, 4), np.uint8)
+    front[60:140, 60:140] = (90, 90, 200, 255)
+    for i, a in enumerate((40, 110, 190)):                 # the feathered rim
+        front[60 + i, 60:140, 3] = a
+        front[139 - i, 60:140, 3] = a
+    # see-through's colour drift: the front part's own idea of the rim is wrong.
+    front[60:63, 60:140, :3] = (20, 20, 20)
+    front[137:140, 60:140, :3] = (20, 20, 20)
+
+    artwork = behind.copy()
+    fa = front[..., 3:4].astype(np.float64) / 255.0
+    artwork[..., :3] = (front[..., :3] * fa + behind[..., :3] * (1 - fa)).astype(np.uint8)
+
+    decomp = Decomposition(canvas=(200, 200), src_img=artwork, parts=[])
+    ordered = [Part(name="bottomwear@torso", rgba=behind, offset=(0, 0)),
+               Part(name="topwear@torso", rgba=front, offset=(0, 0))]
+
+    def composite(items):
+        acc = np.zeros((200, 200, 3), np.float64)
+        alpha = np.zeros((200, 200, 1), np.float64)
+        for q in items:
+            r = q.canvas_rgba(decomp.canvas).astype(np.float64) / 255.0
+            a = r[..., 3:4]
+            acc = r[..., :3] * a + acc * (1 - a)
+            alpha = a + alpha * (1 - a)
+        return acc * 255.0
+
+    want = artwork[..., :3].astype(np.float64)
+    band = np.zeros((200, 200), bool)
+    band[60:63, 60:140] = True
+    band[137:140, 60:140] = True
+
+    high = composite(rig_mod.restore_source_pixels(
+        ordered, decomp, RS(source_pixel_alpha_floor_interior=64)))
+    # Only the outermost row of the rim sits under a floor of 64, and one row of
+    # three is all it takes -- a scratch is one pixel wide.
+    assert np.abs(high - want).max(axis=2)[band].max() > 15, (
+        "the case is meant to reproduce the defect; a floor of 64 left the "
+        "feathered band alone and it still matched")
+
+    got = composite(rig_mod.restore_source_pixels(ordered, decomp, RS()))
+    worst = float(np.abs(got - want).max(axis=2)[band].max())
+    assert worst < 3, f"the feathered band is still {worst:.0f} levels off"
