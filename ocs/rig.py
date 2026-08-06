@@ -838,11 +838,26 @@ def close_layer_seams(
         # The sibling's territory, minus this piece's own contribution to it.
         sibling = _window(siblings[taxonomy.base_tag(part.name)]) & ~core
 
-        # A pixel must sit on the part's own rim or in a sibling's territory, and
-        # must not sit in a hole *enclosed* by the part: the gaps between the
-        # fingers of a hand are interior holes a few pixels wide, so a rim reaching
-        # in from both sides would meet in the middle and seal them.
-        rim = alpha > s.source_alpha_touch_floor
+        # Only into a sibling slice's territory, and never into a hole *enclosed*
+        # by the part: the gaps between the fingers of a hand are interior holes a
+        # few pixels wide, and an extension reaching in from both sides would meet
+        # in the middle and seal them.
+        #
+        # Extending across the part's own feathered rim as well was tried and
+        # removed. It is what the original arithmetic argued for, but with
+        # ``restore_source_alpha`` now matching the artwork's opacity at every
+        # level it buys nothing measurable -- and it costs a band of fully opaque
+        # texels that travels with the part. Over the shin the sheer sleeve
+        # carried 1653 such pixels: invisible at rest, because the colour repaint
+        # gives them the artwork's value, and a hard-edged strip sliding down the
+        # leg the moment the arm moves.
+        #
+        #                      band over leg   canvas >12   canvas >25   sibling
+        #   rim | sibling               1653         1717          598     18705
+        #   sibling only                 289         1701          582     18705
+        #
+        # Better on every count, and the cut-bridging that the sibling clause
+        # exists for is untouched.
         enclosed = ndi.binary_fill_holes(core) & ~core
 
         # And not where something *behind* is feathering across the same pixel.
@@ -863,7 +878,7 @@ def close_layer_seams(
         # A cut is unaffected: the piece behind is either fully opaque there or
         # not present at all, never mid-taper, so nothing is skipped.
         grown = (ndi.binary_dilation(core, struct, iterations=radius)
-                 & ~core & (rim | sibling) & ~enclosed & ~_window(feathered_behind))
+                 & ~core & sibling & ~enclosed & ~_window(feathered_behind))
 
         target = grown & allowed
         if not target.any():

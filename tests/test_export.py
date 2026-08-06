@@ -1345,3 +1345,53 @@ def test_the_silhouette_keeps_the_artwork_s_faintest_rim_pixel(figure):
     assert lost.sum() <= faint.sum() * 0.05, (
         f"{int(lost.sum())} of {int(faint.sum())} faint rim pixels are missing, "
         "so the silhouette is harder than the artwork")
+
+
+def test_a_part_only_extends_into_its_own_layer_s_slices(figure):
+    """An opaque band that travels with a part is worse than the seam it closes.
+
+    close_layer_seams used to extend across a part's own feathered rim as well as
+    into a sibling slice. The rim case is what the original arithmetic argued for,
+    but ``restore_source_alpha`` now matches the artwork's opacity at every level,
+    so it buys nothing measurable -- and it costs a band of fully opaque texels
+    baked into the part, which travels with it.
+
+    Over the shin the sheer sleeve carried 1653 of them. At rest they are
+    invisible, because the colour repaint gives them the artwork's value; the
+    moment the arm moves they are a hard-edged strip sliding down the leg.
+
+                         band over leg   canvas >12   canvas >25   sibling
+      rim | sibling               1653         1717          598     18705
+      sibling only                 289         1701          582     18705
+    """
+    import numpy as np
+
+    from ocs import rig as rig_mod
+    from ocs.config import RigSettings
+
+    reports = cleanup.analyze(figure)
+    kept, _ = cleanup.apply_verdicts(figure, reports)
+    rig = skeleton.guess_rig(figure, kept)
+    parts, _ = limbs.partition(figure, kept, rig, RigSettings())
+    ordered = rig_mod._resolve_draw_order(parts, figure)
+    sealed = rig_mod.close_layer_seams(ordered, figure, RigSettings())
+
+    by_tag: dict[str, np.ndarray] = {}
+    for p in ordered:
+        tag = taxonomy.base_tag(p.name)
+        m = p.canvas_rgba(figure.canvas)[..., 3] >= 250
+        by_tag[tag] = m if tag not in by_tag else (by_tag[tag] | m)
+
+    grew_total = 0
+    for before, after in zip(ordered, sealed):
+        a0 = before.canvas_rgba(figure.canvas)[..., 3]
+        a1 = after.canvas_rgba(figure.canvas)[..., 3]
+        grew = (a1 >= 250) & (a0 < 250)
+        if not grew.any():
+            continue
+        grew_total += int(grew.sum())
+        outside = grew & ~by_tag[taxonomy.base_tag(after.name)]
+        assert outside.sum() == 0, (
+            f"{after.name} grew {int(outside.sum())} opaque px outside its own "
+            "layer's slices; that band travels with the part")
+    assert grew_total, "no seam was closed at all, so the check proved nothing"
