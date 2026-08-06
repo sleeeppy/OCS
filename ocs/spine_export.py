@@ -203,25 +203,103 @@ def _sym(side: str, degrees: float) -> float:
     return degrees if side == "left" else -degrees
 
 
+#: How long one breath takes, in seconds.
+_IDLE_LOOP = 3.6
+
+#: Lag down the body, as a fraction of the loop. A breath starts at the trunk and
+#: arrives at the ends of the hair a good part of a second later.
+_IDLE_LAG = {
+    "torso": 0.0, "neck": 0.05, "head": 0.09, "hairBack": 0.17,
+    "leftArm": 0.07, "rightArm": 0.07, "leftElbow": 0.12, "rightElbow": 0.12,
+    "tail": 0.15,
+}
+
+#: A few percent of amplitude difference between the two sides. Nobody is
+#: symmetric, and an exact mirror is the single clearest tell that a machine
+#: wrote the animation.
+_IDLE_BIAS = {"left": 1.0, "right": 0.82}
+
+
+def _cycle(
+    amplitude: float, lag: float, cycles: int = 1, loop: float = _IDLE_LOOP,
+    samples: int = 8, skew: float = 0.0,
+) -> tuple[tuple[float, float], ...]:
+    """(time, value) samples of a phase-shifted sine over one loop.
+
+    Closes exactly -- ``cycles`` is a whole number, so the first and last sample
+    are the same value and the loop has no step in it.
+
+    ``skew`` leans the wave so the two halves take different times, which is what
+    breathing actually does: a quick draw in and a longer settle out. A pure sine
+    is symmetric, and symmetric in time is the other half of why generated idles
+    read as mechanical.
+    """
+    frames: list[tuple[float, float]] = []
+    for i in range(samples + 1):
+        u = i / samples
+        phase = (u * cycles + lag) % 1.0
+        # Skew maps the phase through a curve that is faster over the first half.
+        if skew:
+            phase = phase + skew * math.sin(2.0 * math.pi * phase) / (2.0 * math.pi)
+        frames.append((round(u * loop, 4),
+                       amplitude * math.sin(2.0 * math.pi * phase)))
+    # The loop must land back exactly where it started.
+    frames[-1] = (frames[-1][0], frames[0][1])
+    return tuple(frames)
+
+
 def _idle(available: set[str]) -> dict:
-    """Breathing sway, ~1.8 s loop. The one animation every rig should have."""
+    """Breathing sway, 3.6 s loop.
+
+    Rewritten to stop looking rigged. The previous version moved every bone on
+    one 1.8 s cycle that peaked at 0.9 s and returned to zero at 1.8 s, with the
+    two sides exactly mirrored -- so the whole figure inhaled, paused and exhaled
+    as a single rigid object, on the beat, twice as fast as a person breathes.
+    Three things carry almost all of the difference:
+
+    - **Lag down the chain.** A breath starts at the trunk; the neck follows, the
+      head after that, the hair last. Everything arriving at once is the thing
+      that reads as machinery. See ``_IDLE_LAG``.
+    - **No exact mirror.** One side moves a little less than the other.
+    - **Asymmetric timing.** Breathing in is quicker than settling out, which a
+      plain sine cannot express. See ``_cycle``'s ``skew``.
+
+    The head also carries a second, slower drift at half the breathing rate, so
+    the pose it returns to is never quite the pose it left -- a person holding
+    still is never actually still.
+    """
     bones: dict[str, dict] = {}
+
+    def lag(bone: str) -> float:
+        return _IDLE_LAG.get(bone, 0.0)
+
     if "torso" in available:
-        bones["torso"] = {"translate": _trans((0, 0, 0), (0.9, 0, 2.5), (1.8, 0, 0))}
+        rise = _cycle(1.7, lag("torso"), skew=0.35)
+        bones["torso"] = {
+            "translate": _trans(*[(t, 0.0, v + 1.7) for t, v in rise])
+        }
     if "neck" in available:
-        bones["neck"] = {"rotate": _rot((0, 0), (0.9, 1.4), (1.8, 0))}
+        bones["neck"] = {"rotate": _rot(*_cycle(1.1, lag("neck"), skew=0.3))}
     if "head" in available:
-        bones["head"] = {"rotate": _rot((0, 0), (0.6, -1.2), (1.2, 1.2), (1.8, 0))}
+        fast = _cycle(0.8, lag("head"), skew=0.3)
+        slow = _cycle(0.9, 0.32, cycles=1, samples=8)
+        bones["head"] = {"rotate": _rot(
+            *[(t, v + slow[i][1] * 0.5) for i, (t, v) in enumerate(fast)])}
     for side in ("left", "right"):
+        bias = _IDLE_BIAS[side]
         arm, elbow = f"{side}Arm", f"{side}Elbow"
         if arm in available:
-            bones[arm] = {"rotate": _rot((0, 0), (0.9, _sym(side, 2.2)), (1.8, 0))}
+            bones[arm] = {"rotate": _rot(
+                *_cycle(_sym(side, 1.6) * bias, lag(arm), skew=0.25))}
         if elbow in available:
-            bones[elbow] = {"rotate": _rot((0, 0), (0.9, _sym(side, 1.6)), (1.8, 0))}
+            bones[elbow] = {"rotate": _rot(
+                *_cycle(_sym(side, 1.1) * bias, lag(elbow), skew=0.25))}
     if "hairBack" in available:
-        bones["hairBack"] = {"rotate": _rot((0, 0), (0.9, 2.0), (1.8, 0))}
+        # Hair is dead weight on the end of the chain: it lags most and, having
+        # nothing driving it back, swings wider than what moves it.
+        bones["hairBack"] = {"rotate": _rot(*_cycle(2.4, lag("hairBack")))}
     if "tail" in available:
-        bones["tail"] = {"rotate": _rot((0, 0), (0.45, 6), (1.35, -6), (1.8, 0))}
+        bones["tail"] = {"rotate": _rot(*_cycle(6.0, lag("tail")))}
     return {"bones": bones}
 
 
@@ -309,14 +387,41 @@ def _jump(available: set[str]) -> dict:
 
 
 def _turn_head(available: set[str]) -> dict:
-    """Look left, look right, centre. Cheap way to see the head rig working."""
+    """Look left, look right, centre. Cheap way to see the head rig working.
+
+    Ordered the way a person does it, which is not all at once:
+
+    - **the eyes go first.** Gaze leads a head turn by something like a tenth of
+      a second; a head and its pupils rotating on the same keyframe is the single
+      most recognisable sign of a generated animation.
+    - **the neck follows the head**, not the other way round, and by less.
+    - **the hair arrives last** and overshoots, because nothing is driving it
+      back except the head it hangs off.
+
+    The head also holds at each end rather than turning straight through, so the
+    motion reads as looking at something instead of sweeping past it.
+    """
     bones: dict[str, dict] = {}
-    if "head" in available:
-        bones["head"] = {"rotate": _rot((0, 0), (0.5, 9), (1.2, -9), (1.8, 0))}
-    if "neck" in available:
-        bones["neck"] = {"rotate": _rot((0, 0), (0.5, 4), (1.2, -4), (1.8, 0))}
     if "eyes" in available:
-        bones["eyes"] = {"translate": _trans((0, 0, 0), (0.5, 3, 0), (1.2, -3, 0), (1.8, 0, 0))}
+        bones["eyes"] = {"translate": _trans(
+            (0, 0, 0), (0.34, 3.4, 0), (0.62, 3.0, 0), (1.02, -3.4, 0),
+            (1.34, -3.0, 0), (1.7, 0, 0), (2.0, 0, 0),
+        )}
+    if "head" in available:
+        bones["head"] = {"rotate": _rot(
+            (0, 0), (0.46, 9), (0.74, 8.4), (1.14, -9), (1.46, -8.4),
+            (1.82, 0), (2.0, 0),
+        )}
+    if "neck" in available:
+        bones["neck"] = {"rotate": _rot(
+            (0, 0), (0.56, 3.8), (0.84, 3.5), (1.24, -3.8), (1.56, -3.5),
+            (1.9, 0), (2.0, 0),
+        )}
+    if "hairBack" in available:
+        bones["hairBack"] = {"rotate": _rot(
+            (0, 0), (0.66, -6.5), (0.98, 1.6), (1.38, 6.5), (1.7, -1.6),
+            (2.0, 0),
+        )}
     return {"bones": bones}
 
 

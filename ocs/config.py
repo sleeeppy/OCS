@@ -115,6 +115,15 @@ class RigSettings:
     weight_falloff: float = 2.0
     #: Vertices closer than this to a bone are pinned fully to it.
     weight_pin_px: float = 4.0
+    #: Pool the weights of mesh vertices this close together across attachments.
+    #:
+    #: Each part is weighted against its own candidate bones, so two parts meeting
+    #: along a cut get different answers at the same point and travel apart as soon
+    #: as anything moves -- the seam tears open far wider than close_layer_seams
+    #: overlaps it. Measured L1 weight distance across coincident vertices, out of
+    #: 2.0: 1.559 for back hair against face, 1.194 across the cut in handwear-r.
+    #: See ``rig.weld_shared_vertices``.
+    weld_radius_px: float = 3.0
     #: Keep each limb as one part spanning its whole chain, instead of cutting it
     #: at the elbow / knee.
     #:

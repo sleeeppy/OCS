@@ -651,3 +651,51 @@ def test_two_layers_may_not_stack_past_the_artwork_where_it_is_soft():
     limited = composite(rig_mod_local.limit_source_alpha([b, a], decomp, RS()))
     worst = float(np.abs(limited - src).max() * 255)
     assert worst < 3, f"composite still differs from the artwork by {worst:.0f} levels"
+
+
+def test_parts_that_meet_agree_on_where_they_are_going(figure):
+    """A seam holds only if both sides of it are weighted the same.
+
+    ``_candidate_bones`` hands every part a different set of bones -- on purpose,
+    so a skirt on the hip cannot follow a hand that happens to be the nearest
+    bone -- and ``_weights`` then solves within that set. Two parts meeting along
+    a cut therefore get different answers at the very same point. At rest they sit
+    on top of each other and nothing shows; move anything and they travel apart,
+    opening the seam far wider than ``close_layer_seams`` overlaps it. That is the
+    tearing. Measured L1 distance between weight maps at coincident vertices, out
+    of a possible 2.0: 1.559 for back hair against face, 1.194 across the cut that
+    splits ``handwear-r`` into an arm piece and a leg piece.
+    """
+    import numpy as np
+
+    from ocs import rig as rig_mod
+    from ocs.config import RigSettings
+
+    built, _ = build(figure)
+    names = [sl.name for sl in built.slots
+             if built.attachments[sl.name].kind == "mesh"]
+
+    def geometry(name):
+        att = built.attachments[name]
+        uv = np.asarray(att.uvs).reshape(-1, 2)
+        px = uv * [att.width, att.height] + np.array(built.part_images[name].bbox[:2])
+        return px, rig_mod._unpack_vertices(att, built.bones)
+
+    geo = {n: geometry(n) for n in names}
+    radius = RigSettings().weld_radius_px
+    checked, worst, where = 0, 0.0, ""
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            pa, wa = geo[a]
+            pb, wb = geo[b]
+            d = np.linalg.norm(pa[:, None, :] - pb[None, :, :], axis=2)
+            for x, y in zip(*np.nonzero(d <= radius)):
+                keys = set(wa[x]) | set(wb[y])
+                gap = sum(abs(wa[x].get(k, 0.0) - wb[y].get(k, 0.0)) for k in keys)
+                checked += 1
+                if gap > worst:
+                    worst, where = gap, f"{a} | {b}"
+
+    assert checked > 0, "fixture should have parts that meet along a seam"
+    assert worst < 0.02, (
+        f"{where} disagree by {worst:.3f} at a shared vertex, so the seam tears")

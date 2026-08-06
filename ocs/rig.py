@@ -111,6 +111,8 @@ class RigResult:
     attachments: dict[str, Attachment]
     part_images: dict[str, Part]
     warnings: list[str] = field(default_factory=list)
+    #: How many mesh vertices ``weld_shared_vertices`` pooled across a seam.
+    welded_vertices: int = 0
 
     def bone_index(self) -> dict[str, int]:
         return {b.name: i for i, b in enumerate(self.bones)}
@@ -802,10 +804,18 @@ def close_layer_seams(
             acc = siblings[tag] = np.zeros((ch, cw), dtype=bool)
         acc |= part.canvas_rgba(decomp.canvas)[..., 3] >= s.source_alpha_solid_floor
 
+    # Feathering already claimed by something further back, accumulated as the
+    # draw order is walked. See the ``feathered_behind`` test below.
+    behind = np.zeros((ch, cw), dtype=bool)
+
     out: list[Part] = []
     for part in ordered:
         alpha = part.rgba[..., 3]
         core = alpha >= s.source_alpha_solid_floor
+        canvas_alpha = part.canvas_rgba(decomp.canvas)[..., 3]
+        feathered_behind = behind.copy()
+        behind |= ((canvas_alpha > s.source_alpha_touch_floor)
+                   & (canvas_alpha < s.source_alpha_solid_floor))
         if not core.any():
             out.append(part)
             continue
@@ -834,8 +844,26 @@ def close_layer_seams(
         # in from both sides would meet in the middle and seal them.
         rim = alpha > s.source_alpha_touch_floor
         enclosed = ndi.binary_fill_holes(core) & ~core
+
+        # And not where something *behind* is feathering across the same pixel.
+        #
+        # The extension is meant for the layer behind, as the arithmetic above
+        # says: raising the front one closes the alpha gap but replaces the blend
+        # with the front layer's colour alone. Two parts feathering into each other
+        # are not a cut, they are the artwork's own antialiasing between two
+        # different objects, and raising both makes the later-drawn one win
+        # outright -- which also hands it the pixels, and the bone they ride.
+        #
+        # That is the chin stuck to the hand. ``handwear-r@arm_r`` and ``face``
+        # both taper off along the jaw; sealing raised both, the hand is drawn
+        # after the face, and 139 px of jaw went with ``rightArm`` whenever the
+        # arm moved. Letting the face -- the part behind -- own the blend puts
+        # them back on ``head``.
+        #
+        # A cut is unaffected: the piece behind is either fully opaque there or
+        # not present at all, never mid-taper, so nothing is skipped.
         grown = (ndi.binary_dilation(core, struct, iterations=radius)
-                 & ~core & (rim | sibling) & ~enclosed)
+                 & ~core & (rim | sibling) & ~enclosed & ~_window(feathered_behind))
 
         target = grown & allowed
         if not target.any():
@@ -1133,6 +1161,160 @@ def restore_source_pixels(
     return out
 
 
+def _unpack_vertices(
+    attachment: Attachment, bones: list[BoneTransform]
+) -> list[dict[str, float]]:
+    """The weight map per vertex, keyed by bone name."""
+    by_index = {i: b.name for i, b in enumerate(bones)}
+    out: list[dict[str, float]] = []
+    stream, i = attachment.vertices, 0
+    while i < len(stream):
+        count = int(stream[i])
+        i += 1
+        entry: dict[str, float] = {}
+        for _ in range(count):
+            entry[by_index[int(stream[i])]] = float(stream[i + 3])
+            i += 4
+        out.append(entry)
+    return out
+
+
+def weld_shared_vertices(
+    attachments: dict[str, Attachment],
+    part_images: dict[str, Part],
+    bones: list[BoneTransform],
+    bone_index: dict[str, int],
+    origin: tuple[float, float],
+    s: RigSettings,
+) -> int:
+    """Give vertices that share a position the same weights, so they move as one.
+
+    This is the tearing, and it is not a weighting bug so much as a consequence of
+    weighting each part on its own. ``_candidate_bones`` hands every part a
+    different set of bones -- deliberately, so a skirt on the hip cannot follow a
+    hand that happens to be the nearest bone -- and ``_weights`` then solves within
+    that set. Two parts that meet along a cut therefore get *different* answers at
+    the very same point, and the seam is only as strong as the weakest agreement.
+
+    Measured over coincident vertices, as an L1 distance between weight maps out
+    of a possible 2.0:
+
+        back hair | face                          1.559
+        handwear-r@arm_r | handwear-r@leg_r       1.194
+        back hair | front hair                    0.724
+        topwear@arm_l_upper | topwear@torso       0.510
+
+    The second is the cut down the thigh. At rest the two halves sit on top of each
+    other and nothing shows; rotate the arm and they travel in different
+    directions, opening the seam by far more than the few pixels
+    ``close_layer_seams`` overlaps them by. That is what tears.
+
+    So the shared boundary is welded: vertices within ``weld_radius_px`` of each
+    other, across attachments, are pooled and every one of them is given the mean
+    of the pool. Averaging rather than picking a winner keeps each part's own
+    solution in the mix, and a vertex only ever moves toward its neighbours, never
+    onto a bone none of them use.
+
+    Only across *different* attachments -- welding a part to itself would do
+    nothing, and vertices interior to a part are left exactly as they were, so the
+    inside of a mesh still deforms the way its own bones say.
+
+    Returns the number of vertices whose weights changed.
+    """
+    radius = float(s.weld_radius_px)
+    if radius <= 0:
+        return 0
+
+    names = [n for n, a in attachments.items() if a.kind == "mesh" and a.vertices]
+    if len(names) < 2:
+        return 0
+
+    # World position of every vertex, and the weight map beside it.
+    points: list[np.ndarray] = []
+    maps: dict[str, list[dict[str, float]]] = {}
+    owner: list[str] = []
+    for name in names:
+        att = attachments[name]
+        ox, oy = part_images[name].offset
+        uv = np.asarray(att.uvs, dtype=np.float64).reshape(-1, 2)
+        px = uv * np.array([att.width, att.height]) + np.array([ox, oy])
+        world = np.array([px_to_spine((float(x), float(y)), origin) for x, y in px])
+        points.append(world)
+        maps[name] = _unpack_vertices(att, bones)
+        owner.extend([name] * world.shape[0])
+
+    allpts = np.concatenate(points, axis=0)
+    index: list[tuple[str, int]] = []
+    for name, world in zip(names, points):
+        index.extend((name, i) for i in range(world.shape[0]))
+
+    # Pool by position. A grid bucket of one radius, checking the 3x3 around each
+    # vertex, is enough -- these are boundary vertices, a handful per pair.
+    buckets: dict[tuple[int, int], list[int]] = {}
+    keys = np.floor(allpts / radius).astype(int)
+    for i, (kx, ky) in enumerate(keys):
+        buckets.setdefault((int(kx), int(ky)), []).append(i)
+
+    welded = 0
+    updates: dict[str, dict[int, dict[str, float]]] = {n: {} for n in names}
+    seen: set[int] = set()
+    for i in range(allpts.shape[0]):
+        if i in seen:
+            continue
+        kx, ky = keys[i]
+        near: list[int] = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                near.extend(buckets.get((int(kx) + dx, int(ky) + dy), ()))
+        group = [j for j in near
+                 if float(np.linalg.norm(allpts[j] - allpts[i])) <= radius]
+        if len({owner[j] for j in group}) < 2:
+            continue
+        pooled: dict[str, float] = {}
+        for j in group:
+            name, vi = index[j]
+            for bone_name, weight in maps[name][vi].items():
+                pooled[bone_name] = pooled.get(bone_name, 0.0) + weight
+        total = sum(pooled.values())
+        if total <= 0:
+            continue
+        top = sorted(pooled.items(), key=lambda kv: -kv[1])[:s.max_bones_per_vertex]
+        norm = sum(w for _b, w in top)
+        shared = {b: w / norm for b, w in top}
+        for j in group:
+            name, vi = index[j]
+            updates[name][vi] = shared
+            seen.add(j)
+        welded += len(group)
+
+    for name in names:
+        if not updates[name]:
+            continue
+        att = attachments[name]
+        ox, oy = part_images[name].offset
+        uv = np.asarray(att.uvs, dtype=np.float64).reshape(-1, 2)
+        px = uv * np.array([att.width, att.height]) + np.array([ox, oy])
+        by_name = {b.name: b for b in bones}
+        stream: list[float] = []
+        used: set[int] = set()
+        for vi in range(uv.shape[0]):
+            entry = updates[name].get(vi) or maps[name][vi]
+            world = px_to_spine((float(px[vi, 0]), float(px[vi, 1])), origin)
+            stream.append(float(len(entry)))
+            for bone_name, weight in entry.items():
+                bone = by_name[bone_name]
+                lx, ly = _to_bone_local(world, bone)
+                idx = bone_index[bone_name]
+                used.add(idx)
+                stream.extend([float(idx), lx, ly, weight])
+        attachments[name] = Attachment(
+            name=att.name, kind=att.kind, width=att.width, height=att.height,
+            uvs=att.uvs, triangles=att.triangles, hull=att.hull, edges=att.edges,
+            vertices=stream, bones_used=sorted(used),
+        )
+    return welded
+
+
 def _wants_mesh(part: Part) -> bool:
     # Anything the bone partition cut spans a joint by construction, and the
     # bulky garments deform. Everything else is a rigid feature.
@@ -1198,7 +1380,13 @@ def build_rig(
             depth_median=part.depth_median, z_prior=taxonomy.z_prior(part.name),
         ))
 
+    # Last, over the finished meshes: a seam holds only if both sides of it agree
+    # on where they are going.
+    welded = weld_shared_vertices(
+        attachments, images, bones, bone_index, origin, s)
+
     return RigResult(
         canvas=rig.canvas, origin_px=origin, bones=bones, slots=slots,
         attachments=attachments, part_images=images, warnings=warnings,
+        welded_vertices=welded,
     )
