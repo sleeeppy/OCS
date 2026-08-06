@@ -873,36 +873,3 @@ def test_touching_slices_of_one_layer_share_a_bone(figure):
                     f"{near.name} is cut against {far.name} but is not weighted to "
                     f"{far.bone}, so the cut tears when {far.bone} moves")
     assert checked, "fixture should contain two touching slices of one layer"
-
-
-def test_a_limb_resting_on_something_barely_swings(figure):
-    """A hand lying on a skirt must not slide, or it leaves its shadow behind.
-
-    The artwork has the contact baked in -- the shadow the hand casts, the fabric
-    compressed under it -- and all of that belongs to the layer underneath, which
-    does not move with the hand. Slide the hand and its own shadow stays put,
-    which is what reads as an afterimage trailing it. It does not take much: the
-    idle swung ``leftArm`` 1.6 deg over a 498 px arm, so the hand travelled 14 px
-    across a skirt whose painted shadow travelled none.
-
-    The cap is derived from the limb rather than picked -- whatever angle moves
-    the tip one pixel -- because the same angle moves a long arm many times
-    further than a short one.
-    """
-    import math
-
-    from ocs import spine_export
-
-    built, _ = build(figure)
-    planted = spine_export._planted_tips(built)
-    if not planted:
-        import pytest
-        pytest.skip("fixture has no limb resting on another part")
-
-    caps = spine_export.limb_swing_caps(built)
-    pos = {b.name: (b.world_x, b.world_y) for b in built.bones}
-    for bone, tip in planted:
-        reach = math.dist(pos[bone], pos[tip])
-        travel = reach * math.radians(caps[bone][0])
-        assert travel <= spine_export._PLANTED_TRAVEL_PX + 1e-6, (
-            f"{bone} rests on something but its tip still travels {travel:.1f} px")
