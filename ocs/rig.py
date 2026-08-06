@@ -1369,6 +1369,55 @@ def build_rig(
     if s.restore_source_pixels:
         ordered = restore_source_pixels(ordered, decomp, s)
 
+    # Slices of one layer that touch are weighted across their shared cut.
+    #
+    # Each part is otherwise solved against its own candidate bones, so two
+    # slices of the same layer get different answers at the same point and the
+    # cut between them opens as soon as anything moves. ``weld_shared_vertices``
+    # pins that shut where their vertices happen to coincide, but the contour
+    # simplification puts vertices in different places along the rest of the
+    # boundary, and between the pins it is still free.
+    #
+    # It showed up as an outline appearing along the thigh whenever the arm
+    # lifted. ``handwear-r`` arrives as one sleeve and OCS cuts a ``leg_r`` piece
+    # out of it to satisfy requirement 2-2, so half of it rides ``rightArm`` and
+    # half ``rightLeg``; raising the arm slid one off the other and exposed the
+    # lower piece's own edge. Hiding either half removed the line -- 47 of 76
+    # ridge pixels for the leg piece, 19 for the arm piece.
+    #
+    # Each piece gets the *primary bone* of the pieces it actually touches, and
+    # nothing else. Handing a family the union of all its slices' chains instead
+    # is far too much: it put the right sleeve on ``head`` and ``hairBack`` and
+    # the skirt on ``leftElbow``, because ``_weights`` picks the nearest bones out
+    # of whatever it is offered and a sleeve passes close to the neck. One bone
+    # per neighbour is enough for the weighting to vary continuously across the
+    # cut, which is all that has to be true for it not to tear.
+    neighbour_bones: dict[str, list[str]] = {}
+    meshed = [q for q in ordered if _wants_mesh(q)]
+    primary_of: dict[str, str] = {}
+    solid: dict[str, np.ndarray] = {}
+    for part in meshed:
+        name = taxonomy.bone_for_part(part.name, available)
+        if name not in bone_index:
+            name = "torso" if "torso" in bone_index else bones[0].name
+        primary_of[part.name] = name
+        solid[part.name] = (part.canvas_rgba(decomp.canvas)[..., 3]
+                            >= s.source_alpha_solid_floor)
+    reach = ndi.generate_binary_structure(2, 2)
+    for i, a in enumerate(meshed):
+        for b in meshed[i + 1:]:
+            if taxonomy.base_tag(a.name) != taxonomy.base_tag(b.name):
+                continue
+            if primary_of[a.name] == primary_of[b.name]:
+                continue
+            touching = ndi.binary_dilation(
+                solid[a.name], reach, iterations=max(1, int(s.outline_dilate_px))
+            ) & solid[b.name]
+            if not touching.any():
+                continue
+            neighbour_bones.setdefault(a.name, []).append(primary_of[b.name])
+            neighbour_bones.setdefault(b.name, []).append(primary_of[a.name])
+
     for part in ordered:
         slug = naming.unique_slug(part.name)
         primary = taxonomy.bone_for_part(part.name, available)
@@ -1377,9 +1426,12 @@ def build_rig(
 
         attachment: Attachment | None = None
         if _wants_mesh(part):
+            candidates = _candidate_bones(part, rig, primary)
+            for bone in neighbour_bones.get(part.name, ()):
+                if bone not in candidates:
+                    candidates = candidates + [bone]
             attachment = _mesh_attachment(
-                part, slug, bones, bone_index,
-                _candidate_bones(part, rig, primary), origin, s,
+                part, slug, bones, bone_index, candidates, origin, s,
             )
             if attachment is None:
                 warnings.append(f"{part.name}: mesh build failed, fell back to region")

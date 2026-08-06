@@ -338,23 +338,51 @@ def _walk(available: set[str]) -> dict:
 
 
 def _wave(available: set[str]) -> dict:
-    """Right arm greeting, 1.2 s. Uses the character's right, i.e. viewer left.
+    """Right arm greeting, 2.4 s. Uses the character's right, i.e. viewer left.
 
     A single-limb gesture needs an absolute direction, so no per-side flip: the
     arm hangs down, and a negative rotation lifts it up and away from the body.
+
+    Rewritten because this was the clunkiest of the presets. It went from rest to
+    -110 deg in 0.3 s, sat there for 0.7 s, and snapped back in 0.2 s -- an arm
+    teleporting to a pose, freezing, and teleporting back, with the forearm
+    metronoming at a fixed +-21 deg the whole time. Four things fix it, and none
+    of them is about the amount of rotation:
+
+    - **Anticipation.** The arm dips slightly the wrong way before it lifts.
+      Nothing in a body starts moving without loading first.
+    - **Overshoot and settle.** It passes the top, comes back under, and settles.
+      A limb that stops dead on its target reads as a machine hitting a limit.
+    - **A decaying wave.** The forearm swings widest first and each swing is
+      smaller and slower than the last, instead of ticking at one amplitude.
+    - **Follow-through.** Shoulder, torso and head lead and trail rather than
+      turning on the same keys, and the arm comes down over twice as long as it
+      went up, because gravity is not what raised it.
     """
     bones: dict[str, dict] = {}
     arm, elbow = "rightArm", "rightElbow"
     if arm in available:
-        bones[arm] = {"rotate": _rot((0, 0), (0.3, -110), (1.0, -110), (1.2, 0))}
+        bones[arm] = {"rotate": _rot(
+            (0, 0), (0.16, 7), (0.62, -116), (0.82, -103), (0.98, -109),
+            (1.62, -106), (1.9, -112), (2.18, -18), (2.4, 0),
+        )}
     if elbow in available:
         bones[elbow] = {"rotate": _rot(
-            (0, 0), (0.3, -20), (0.5, 22), (0.7, -20), (0.9, 22), (1.2, 0),
+            (0, 0), (0.2, 9), (0.62, -26), (0.86, 24), (1.14, -19),
+            (1.44, 15), (1.76, -10), (2.06, 6), (2.4, 0),
+        )}
+    if "torso" in available:
+        bones["torso"] = {"rotate": _rot(
+            (0, 0), (0.3, 1.4), (0.78, -2.6), (1.5, -2.2), (2.1, -1.0), (2.4, 0),
         )}
     if "head" in available:
-        bones["head"] = {"rotate": _rot((0, 0), (0.3, -5), (1.0, -5), (1.2, 0))}
-    if "torso" in available:
-        bones["torso"] = {"rotate": _rot((0, 0), (0.3, -2), (1.0, -2), (1.2, 0))}
+        bones["head"] = {"rotate": _rot(
+            (0, 0), (0.34, 2.0), (0.9, -5.5), (1.5, -4.6), (2.16, -1.4), (2.4, 0),
+        )}
+    if "hairBack" in available:
+        bones["hairBack"] = {"rotate": _rot(
+            (0, 0), (0.5, 3.4), (1.0, -3.0), (1.5, 2.2), (2.0, -1.2), (2.4, 0),
+        )}
     return {"bones": bones}
 
 
@@ -519,7 +547,70 @@ def limb_swing_caps(rig: RigResult) -> dict[str, float]:
         if elbow in pos:
             caps[elbow] = directional(
                 elbow, clearance, dist(elbow, hand) or length / 2.0)
+
+    # --- limbs that are resting on something ------------------------------
+    #
+    # A hand lying on a skirt or propping up a chin cannot drift, and swinging it
+    # a little is worse than not moving it at all. The artwork has the contact
+    # baked in -- the shadow the hand casts, the fabric compressed under it -- and
+    # all of that belongs to the layer underneath, which does not move. Slide the
+    # hand a few pixels and its own shadow stays behind, which is exactly what
+    # reads as an afterimage trailing the hand.
+    #
+    # It does not take much movement. The idle swings ``leftArm`` 1.6 deg, and
+    # that arm is ~500 px long, so the hand travels about 14 px across a skirt
+    # whose painted shadow travels none.
+    #
+    # A limb is resting when its tip sits inside the opaque body of a part that
+    # is not its own -- measured, not assumed, so a free-hanging arm keeps its
+    # full swing.
+    for bone, tip in _planted_tips(rig):
+        # Derived from the limb, not picked: whatever angle moves the tip by one
+        # pixel. Not zero, because an arm frozen solid on a breathing body reads
+        # as pinned, and not a fixed number of degrees, because the same angle
+        # moves a 500 px arm 20 times as far as a 25 px finger.
+        reach = dist(bone, tip)
+        limit = (math.degrees(_PLANTED_TRAVEL_PX / reach)
+                 if reach > _PLANTED_TRAVEL_PX else 180.0)
+        caps[bone] = (limit, limit)
     return caps
+
+
+#: How far the tip of a resting limb may travel, in pixels.
+_PLANTED_TRAVEL_PX = 1.0
+
+
+def _planted_tips(rig: RigResult) -> list[tuple[str, str]]:
+    """Limb bones whose tip lies inside another part's opaque body.
+
+    Returns ``[(chain_bone, tip_bone)]`` for every arm or leg found resting on
+    something. The tip's own chain is excluded, so an arm is not counted as
+    resting on its own sleeve.
+    """
+    pos = {b.name: (b.world_x, b.world_y) for b in rig.bones}
+    origin = rig.origin_px
+    out: list[tuple[str, str]] = []
+    for side in ("left", "right"):
+        chain = [f"{side}Arm", f"{side}Elbow"], f"{side}Hand"
+        for bones, tip in (chain, ([f"{side}Leg", f"{side}Knee"], f"{side}Foot")):
+            if tip not in pos:
+                continue
+            px = int(round(pos[tip][0] + origin[0]))
+            py = int(round(origin[1] - pos[tip][1]))
+            for slot in rig.slots:
+                if slot.bone in bones or slot.bone == tip:
+                    continue
+                part = rig.part_images.get(slot.name)
+                if part is None:
+                    continue
+                x1, y1, x2, y2 = part.bbox
+                if not (x1 <= px < x2 and y1 <= py < y2):
+                    continue
+                if int(part.rgba[py - y1, px - x1, 3]) < 250:
+                    continue
+                out.extend((b, tip) for b in bones if b in pos)
+                break
+    return out
 
 
 def _clamp_rotations(data: dict, caps: dict[str, float]) -> dict:

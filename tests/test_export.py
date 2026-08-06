@@ -816,3 +816,93 @@ def test_the_atlas_is_premultiplied_and_the_player_agrees(figure, tmp_path):
         tmp_path / "skeleton.png", tmp_path / "preview.html")
     assert "premultipliedAlpha: true" in out.read_text(encoding="utf-8"), (
         "the player must blend premultiplied, or every soft edge gains a halo")
+
+
+def test_touching_slices_of_one_layer_share_a_bone(figure):
+    """Two halves of one cut must be weighted continuously across it.
+
+    Each part is otherwise solved against its own candidate bones, so the two
+    sides get different answers at the same point and the cut opens as soon as
+    anything moves. ``weld_shared_vertices`` pins it where their vertices happen
+    to coincide, but the contour simplification puts vertices in different places
+    along the rest of the boundary, and between the pins it is free.
+
+    That is the outline that appeared along the thigh whenever the arm lifted.
+    ``handwear-r`` arrives as one sleeve and OCS cuts a ``leg_r`` piece out of it
+    for requirement 2-2, so half rides ``rightArm`` and half ``rightLeg``; raising
+    the arm slid one off the other and exposed the lower piece's edge. Hiding
+    either half removed the line -- 47 of 76 ridge pixels for the leg piece, 19
+    for the arm piece.
+
+    Each piece gets the *primary bone of the pieces it touches*, and no more.
+    Giving a family the union of all its slices' chains is far too much: it put
+    the right sleeve on ``head`` and ``hairBack`` and the skirt on ``leftElbow``,
+    because ``_weights`` takes the nearest of whatever it is offered.
+    """
+    import numpy as np
+    import scipy.ndimage as ndi
+
+    from ocs import rig as rig_mod
+    from ocs.config import RigSettings
+
+    built, _ = build(figure)
+    names = [b.name for b in built.bones]
+    s = RigSettings()
+
+    meshed = [sl for sl in built.slots
+              if built.attachments[sl.attachment].kind == "mesh"]
+    solid = {sl.name: built.part_images[sl.name].canvas_rgba(figure.canvas)[..., 3] >= 250
+             for sl in meshed}
+    reach = ndi.generate_binary_structure(2, 2)
+
+    checked = 0
+    for i, a in enumerate(meshed):
+        for b in meshed[i + 1:]:
+            if taxonomy.base_tag(a.part_name) != taxonomy.base_tag(b.part_name):
+                continue
+            if a.bone == b.bone:
+                continue
+            if not (ndi.binary_dilation(solid[a.name], reach,
+                                        iterations=s.outline_dilate_px)
+                    & solid[b.name]).any():
+                continue
+            checked += 1
+            for near, far in ((a, b), (b, a)):
+                used = {names[k] for k in built.attachments[near.attachment].bones_used}
+                assert far.bone in used, (
+                    f"{near.name} is cut against {far.name} but is not weighted to "
+                    f"{far.bone}, so the cut tears when {far.bone} moves")
+    assert checked, "fixture should contain two touching slices of one layer"
+
+
+def test_a_limb_resting_on_something_barely_swings(figure):
+    """A hand lying on a skirt must not slide, or it leaves its shadow behind.
+
+    The artwork has the contact baked in -- the shadow the hand casts, the fabric
+    compressed under it -- and all of that belongs to the layer underneath, which
+    does not move with the hand. Slide the hand and its own shadow stays put,
+    which is what reads as an afterimage trailing it. It does not take much: the
+    idle swung ``leftArm`` 1.6 deg over a 498 px arm, so the hand travelled 14 px
+    across a skirt whose painted shadow travelled none.
+
+    The cap is derived from the limb rather than picked -- whatever angle moves
+    the tip one pixel -- because the same angle moves a long arm many times
+    further than a short one.
+    """
+    import math
+
+    from ocs import spine_export
+
+    built, _ = build(figure)
+    planted = spine_export._planted_tips(built)
+    if not planted:
+        import pytest
+        pytest.skip("fixture has no limb resting on another part")
+
+    caps = spine_export.limb_swing_caps(built)
+    pos = {b.name: (b.world_x, b.world_y) for b in built.bones}
+    for bone, tip in planted:
+        reach = math.dist(pos[bone], pos[tip])
+        travel = reach * math.radians(caps[bone][0])
+        assert travel <= spine_export._PLANTED_TRAVEL_PX + 1e-6, (
+            f"{bone} rests on something but its tip still travels {travel:.1f} px")
