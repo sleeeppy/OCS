@@ -1301,3 +1301,47 @@ def test_the_composite_matches_the_artwork_s_alpha_at_every_opacity(figure):
     assert worst < 24, (
         f"the composite falls {worst:.0f} levels below the artwork in its soft "
         "band, which draws a line wherever that band is narrow")
+
+
+def test_the_silhouette_keeps_the_artwork_s_faintest_rim_pixel(figure):
+    """One pixel of missing rim reads as the whole figure being cut out.
+
+    ``restore_source_alpha`` was gated on ``src_alpha > source_alpha_touch_floor``
+    and that floor is 8, but the outermost pixel of an antialiased silhouette is
+    routinely under it -- measured across the thigh, the artwork reads alpha 5 and
+    7 there. Those pixels were skipped, so every silhouette came out one pixel
+    harder than it was drawn. Along a limb that is a continuous line and it looks
+    like the leg was cut out rather than painted.
+
+    Nothing already there could be raised either: the layers missed that pixel
+    entirely, so the restore has to reach one pixel past what a part covers. What
+    it writes is the artwork's own alpha *and* colour -- alpha alone left the
+    reconstructed rim holding whatever the part had at that texel and made the
+    edge worse, peak error over the thigh going 51 to 147.
+    """
+    import numpy as np
+
+    from ocs import rig as rig_mod
+    from ocs.config import RigSettings
+
+    reports = cleanup.analyze(figure)
+    kept, _ = cleanup.apply_verdicts(figure, reports)
+    rig = skeleton.guess_rig(figure, kept)
+    parts, _ = limbs.partition(figure, kept, rig, RigSettings())
+    built = rig_mod.build_rig(figure, parts, rig, RigSettings())
+
+    acc = np.zeros(figure.canvas[::-1], np.float64)
+    for slot in built.slots:
+        a = built.part_images[slot.name].canvas_rgba(figure.canvas)[..., 3] / 255.0
+        acc = a + acc * (1.0 - a)
+
+    src = figure.src_img[..., 3].astype(np.float64) / 255.0
+    faint = (src > 0) & (src <= RigSettings().source_alpha_touch_floor / 255.0)
+    if not faint.any():
+        import pytest
+        pytest.skip("fixture silhouette has no sub-touch-floor rim")
+
+    lost = faint & (acc < src * 0.5)
+    assert lost.sum() <= faint.sum() * 0.05, (
+        f"{int(lost.sum())} of {int(faint.sum())} faint rim pixels are missing, "
+        "so the silhouette is harder than the artwork")

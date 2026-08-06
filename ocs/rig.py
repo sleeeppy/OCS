@@ -918,7 +918,8 @@ def restore_source_alpha(
         return ordered
 
     cw, ch = decomp.canvas
-    src_alpha = decomp.src_img[..., 3]
+    src = decomp.src_img
+    src_alpha = src[..., 3]
 
     # Composite alpha of everything, which is order-independent.
     acc = np.zeros((ch, cw), np.float64)
@@ -943,8 +944,20 @@ def restore_source_alpha(
     #
     # With ``limit_source_alpha`` capping from above, the pair now pins the
     # composite to the artwork from both sides.
+    # Down to the faintest pixel the artist drew, not just the ones above the
+    # touch floor.
+    #
+    # That floor is 8, and the outermost pixel of an antialiased silhouette is
+    # routinely below it -- measured across the thigh, the artwork reads alpha 5
+    # and 7 there. Skipping them dropped the whole outer pixel of the figure, so
+    # every silhouette came out one pixel harder than it was drawn. Along a leg
+    # that is a continuous line, and it reads as the limb being cut out rather
+    # than painted.
+    #
+    # Reconstructing the artwork's own rim cannot make a hard edge, because that
+    # rim *is* the soft edge.
     src_norm = src_alpha.astype(np.float64) / 255.0
-    short = (acc < src_norm - 1.0 / 255.0) & (src_alpha > s.source_alpha_touch_floor)
+    short = (acc < src_norm - 0.5 / 255.0) & (src_alpha > 0)
     if not short.any():
         return ordered
 
@@ -963,14 +976,33 @@ def restore_source_alpha(
 
         window_short = short[cy1:cy2, cx1:cx2] & ~fixed[cy1:cy2, cx1:cx2]
         alpha = part.rgba[sy:sy + h, sx:sx + w, 3]
-        # Only a pixel this part actually contributes to; raising alpha where it
-        # has none would grow the part into territory it never covered.
-        target = window_short & (alpha > s.source_alpha_touch_floor)
+        # A pixel this part reaches, or is within a pixel of reaching. The strict
+        # "must already have alpha here" test cannot rebuild the outer rim at all:
+        # the pixel the artwork drew at alpha 5 is one the layers missed entirely,
+        # so there is nothing there to raise. One pixel of reach is enough to put
+        # it back and too little to grow the part anywhere it does not belong --
+        # and the value written is the artwork's own, so the silhouette ends up
+        # exactly the shape and softness it was drawn with.
+        reach = ndi.binary_dilation(alpha > 0, ndi.generate_binary_structure(2, 2))
+        target = window_short & reach
         if not target.any():
             continue
 
         rgba = part.rgba.copy()
         rgba[sy:sy + h, sx:sx + w, 3][target] = src_alpha[cy1:cy2, cx1:cx2][target]
+        # Colour too, wherever the part had nothing here before. Alpha alone is
+        # half a pixel: a rim texel the layers missed carries whatever colour the
+        # part happened to hold there -- bled from somewhere else, or nothing --
+        # and giving it the artwork's opacity without the artwork's colour made
+        # the outer edge worse, not better (peak error 51 -> 147 over the thigh).
+        #
+        # The artwork stores straight alpha, so its RGB at a rim pixel is the
+        # object's own colour; the background's share is carried by the alpha, not
+        # mixed into the channels. Copying it is exact, and only reaches pixels
+        # the part did not previously cover, so nothing already solved is touched.
+        fresh = target & (part.rgba[sy:sy + h, sx:sx + w, 3] == 0)
+        if fresh.any():
+            rgba[sy:sy + h, sx:sx + w, :3][fresh] = src[cy1:cy2, cx1:cx2, :3][fresh]
         fixed[cy1:cy2, cx1:cx2] |= target
         out[i] = Part(
             name=part.name, rgba=rgba, offset=part.offset,
