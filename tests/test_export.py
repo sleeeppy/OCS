@@ -873,3 +873,40 @@ def test_touching_slices_of_one_layer_share_a_bone(figure):
                     f"{near.name} is cut against {far.name} but is not weighted to "
                     f"{far.bone}, so the cut tears when {far.bone} moves")
     assert checked, "fixture should contain two touching slices of one layer"
+
+
+def test_a_limb_resting_on_something_barely_moves(figure):
+    """A hand lying on a skirt must not slide, or it leaves its shadow behind.
+
+    The artwork has the contact painted in -- the shadow the hand casts, the
+    fabric compressed under it -- and all of that belongs to the layer
+    underneath, which travels with a different bone. Slide the hand and it leaves
+    its own shadow where it was, so you see the hand's edge and a second copy of
+    it a few pixels away. That is the outline that trails the arm.
+
+    It takes very little movement. The idle swings ``leftArm`` 2.2 deg over a
+    498 px arm, so the hand crosses 19 px of skirt whose painted shadow crosses
+    none. Differencing two frames of the idle lit up the whole forearm and hand
+    against a barely-changed skirt; capped, the arm goes dark and only the
+    skirt's own folds move.
+
+    A constraint from the rig, not a change to the gesture: the presets are
+    untouched and a free limb keeps its full swing.
+    """
+    import math
+
+    from ocs import spine_export
+
+    built, _ = build(figure)
+    planted = spine_export._planted_tips(built)
+    if not planted:
+        import pytest
+        pytest.skip("fixture has no limb resting on another part")
+
+    caps = spine_export.limb_swing_caps(built)
+    pos = {b.name: (b.world_x, b.world_y) for b in built.bones}
+    for bone, tip in planted:
+        reach = math.dist(pos[bone], pos[tip])
+        travel = reach * math.radians(caps[bone][0])
+        assert travel <= spine_export._PLANTED_TRAVEL_PX + 1e-6, (
+            f"{bone} rests on something but its tip still travels {travel:.1f} px")

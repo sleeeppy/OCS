@@ -414,7 +414,75 @@ def limb_swing_caps(rig: RigResult) -> dict[str, float]:
         if elbow in pos:
             caps[elbow] = directional(
                 elbow, clearance, dist(elbow, hand) or length / 2.0)
+
+    # --- limbs that are resting on something ------------------------------
+    #
+    # A hand lying on a skirt or propping up a chin cannot drift, and moving it
+    # a little is worse than not moving it at all. The artwork has the contact
+    # painted in -- the shadow the hand casts, the fabric compressed under it --
+    # and every bit of that belongs to the layer underneath, which travels with a
+    # different bone. Slide the hand and it leaves its own shadow behind, so you
+    # see the hand's edge and a second copy of it a few pixels away. That is the
+    # outline that trails the arm.
+    #
+    # It takes very little movement. The idle swings ``leftArm`` 2.2 deg over a
+    # 498 px arm, so the hand crosses 19 px of skirt whose painted shadow crosses
+    # none. Differencing two frames of the idle shows the whole forearm and hand
+    # lit up against a skirt that barely moved.
+    #
+    # This is a constraint from the rig, not a change to the gesture: the presets
+    # are untouched and every free limb keeps its full swing. Only a limb whose
+    # tip is *measured* to be resting on another part is held still.
+    for bone, tip in _planted_tips(rig):
+        # Derived from the limb, not picked: whatever angle moves the tip by one
+        # pixel. Not zero, because an arm frozen solid on a breathing body reads
+        # as pinned, and not a fixed number of degrees, because the same angle
+        # moves a 498 px arm five times as far as a 91 px one.
+        reach = dist(bone, tip)
+        limit = (math.degrees(_PLANTED_TRAVEL_PX / reach)
+                 if reach > _PLANTED_TRAVEL_PX else 180.0)
+        caps[bone] = (limit, limit)
     return caps
+
+
+#: How far the tip of a resting limb may travel, in pixels.
+_PLANTED_TRAVEL_PX = 1.0
+
+
+def _planted_tips(rig: RigResult) -> list[tuple[str, str]]:
+    """Limb bones whose tip lies inside another part's opaque body.
+
+    Returns ``[(chain_bone, tip_bone)]`` for every arm or leg found resting on
+    something. Parts belonging to the limb's own chain are skipped, so an arm is
+    never counted as resting on its own sleeve.
+    """
+    pos = {b.name: (b.world_x, b.world_y) for b in rig.bones}
+    origin = rig.origin_px
+    out: list[tuple[str, str]] = []
+    for side in ("left", "right"):
+        chains = (
+            ([f"{side}Arm", f"{side}Elbow"], f"{side}Hand"),
+            ([f"{side}Leg", f"{side}Knee"], f"{side}Foot"),
+        )
+        for bones, tip in chains:
+            if tip not in pos:
+                continue
+            px = int(round(pos[tip][0] + origin[0]))
+            py = int(round(origin[1] - pos[tip][1]))
+            for slot in rig.slots:
+                if slot.bone in bones or slot.bone == tip:
+                    continue
+                part = rig.part_images.get(slot.name)
+                if part is None:
+                    continue
+                x1, y1, x2, y2 = part.bbox
+                if not (x1 <= px < x2 and y1 <= py < y2):
+                    continue
+                if int(part.rgba[py - y1, px - x1, 3]) < 250:
+                    continue
+                out.extend((b, tip) for b in bones if b in pos)
+                break
+    return out
 
 
 def _clamp_rotations(data: dict, caps: dict[str, float]) -> dict:
