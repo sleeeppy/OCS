@@ -246,3 +246,66 @@ def test_already_split_layers_are_left_alone(figure):
     assert any(p.tag == "handwear" and p.side for p in kept), "fixture is pre-split"
     _parts, report = limbs.partition(figure, kept, rig, RigSettings())
     assert "handwear" not in report["lr_split"]
+
+
+def test_a_forced_limb_region_is_carved_from_a_layer_that_belongs_there():
+    """Requirement 2-2 is unconditional, but not at any price.
+
+    ``enforce_limb_coverage`` picked its source by overlap alone, and on a seated
+    figure with a long sleeve draped across her shin the sleeve covers more of
+    ``leg_r`` than the leg covering does. So the right leg was carved out of
+    ``handwear``: a panel of sleeve fabric standing in for a leg, drawn over the
+    leg region, which then had to be hidden behind the real leg and showed as a
+    hard-edged strip down the shin wherever it stuck out. The draw-order guess
+    could not save it either -- both layers come back from see-through at alpha
+    254, so ``A over B`` reduces to ``A`` and the RGB test simply reports that the
+    leg matches the artwork and the sleeve does not.
+
+    ``allowed_regions`` is the same table that stops the ordinary partition
+    putting a leg layer on an arm, and it belongs here too. Its entries are
+    *segments*, so they have to be compared through ``merged_region_of``:
+    ``leg_r`` never equals ``leg_r_upper``, and without that step every candidate
+    scores zero and overlap decides again.
+    """
+    import numpy as np
+
+    from ocs import taxonomy
+    from ocs.psd_io import Decomposition, Part
+
+    def block(x0, y0, x1, y1, rgb):
+        a = np.zeros((256, 256, 4), np.uint8)
+        a[y0:y1, x0:x1] = (*rgb, 255)
+        return a
+
+    # A leg down the left, and a sleeve draped across it covering more of it.
+    leg = Part(name="legwear", rgba=block(60, 90, 100, 240, (230, 200, 180)),
+               offset=(0, 0))
+    sleeve = Part(name="handwear-r", rgba=block(40, 80, 150, 250, (240, 235, 230)),
+                  offset=(0, 0))
+    torso = Part(name="topwear", rgba=block(90, 20, 170, 110, (200, 60, 60)),
+                 offset=(0, 0))
+    src = np.zeros((256, 256, 4), np.uint8)
+    src[20:250, 40:170] = (200, 120, 100, 255)
+    decomp = Decomposition(canvas=(256, 256), parts=[leg, sleeve, torso], src_img=src)
+
+    target = np.zeros((256, 256), bool)
+    target[90:240, 55:105] = True                       # the leg_r region
+
+    best = None
+    for p in (leg, sleeve, torso):
+        overlap = int((p.canvas_mask(decomp.canvas) & target).sum())
+        if overlap <= 0:
+            continue
+        allowed = taxonomy.allowed_regions(p.tag, p.side)
+        fits = 1 if allowed is None else int(
+            "leg_r" in allowed
+            or any(taxonomy.merged_region_of(a) == "leg_r" for a in allowed))
+        if best is None or (fits, overlap) > (best[0], best[1]):
+            best = (fits, overlap, p)
+
+    assert best is not None
+    assert int((sleeve.canvas_mask(decomp.canvas) & target).sum()) > \
+        int((leg.canvas_mask(decomp.canvas) & target).sum()), \
+        "the case is meant to have the wrong layer covering more of the region"
+    assert best[2].name == "legwear", (
+        f"carved leg_r out of {best[2].name}; overlap alone would pick the sleeve")
