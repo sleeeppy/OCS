@@ -838,26 +838,11 @@ def close_layer_seams(
         # The sibling's territory, minus this piece's own contribution to it.
         sibling = _window(siblings[taxonomy.base_tag(part.name)]) & ~core
 
-        # Only into a sibling slice's territory, and never into a hole *enclosed*
-        # by the part: the gaps between the fingers of a hand are interior holes a
-        # few pixels wide, and an extension reaching in from both sides would meet
-        # in the middle and seal them.
-        #
-        # Extending across the part's own feathered rim as well was tried and
-        # removed. It is what the original arithmetic argued for, but with
-        # ``restore_source_alpha`` now matching the artwork's opacity at every
-        # level it buys nothing measurable -- and it costs a band of fully opaque
-        # texels that travels with the part. Over the shin the sheer sleeve
-        # carried 1653 such pixels: invisible at rest, because the colour repaint
-        # gives them the artwork's value, and a hard-edged strip sliding down the
-        # leg the moment the arm moves.
-        #
-        #                      band over leg   canvas >12   canvas >25   sibling
-        #   rim | sibling               1653         1717          598     18705
-        #   sibling only                 289         1701          582     18705
-        #
-        # Better on every count, and the cut-bridging that the sibling clause
-        # exists for is untouched.
+        # A pixel must sit on the part's own rim or in a sibling's territory, and
+        # must not sit in a hole *enclosed* by the part: the gaps between the
+        # fingers of a hand are interior holes a few pixels wide, so a rim reaching
+        # in from both sides would meet in the middle and seal them.
+        rim = alpha > s.source_alpha_touch_floor
         enclosed = ndi.binary_fill_holes(core) & ~core
 
         # And not where something *behind* is feathering across the same pixel.
@@ -878,7 +863,7 @@ def close_layer_seams(
         # A cut is unaffected: the piece behind is either fully opaque there or
         # not present at all, never mid-taper, so nothing is skipped.
         grown = (ndi.binary_dilation(core, struct, iterations=radius)
-                 & ~core & sibling & ~enclosed & ~_window(feathered_behind))
+                 & ~core & (rim | sibling) & ~enclosed & ~_window(feathered_behind))
 
         target = grown & allowed
         if not target.any():
@@ -923,18 +908,16 @@ def restore_source_alpha(
     it is the part you see, the artwork says the pixel is solid, and raising it
     changes nothing anywhere the reconstruction was already opaque.
 
-    Up to the artwork's own alpha, whatever that is -- not only where the artwork
-    is fully opaque. Matching it cannot produce a hard fringe, because the
-    artwork's alpha *is* the fringe. The reason a high floor exists belongs to the
-    colour repaint instead: copying a rim's colour drags the background inward,
-    copying a rim's opacity does not.
+    Only where the source is genuinely solid. The character's own soft outline is
+    partly transparent in the artwork too, and must stay that way or the silhouette
+    gains a hard fringe.
     """
     if decomp.src_img is None or decomp.src_img.shape[2] < 4:
         return ordered
 
     cw, ch = decomp.canvas
-    src = decomp.src_img
-    src_alpha = src[..., 3]
+    src_alpha = decomp.src_img[..., 3]
+    solid = src_alpha >= s.source_alpha_solid_floor
 
     # Composite alpha of everything, which is order-independent.
     acc = np.zeros((ch, cw), np.float64)
@@ -942,37 +925,7 @@ def restore_source_alpha(
         a = part.canvas_rgba(decomp.canvas)[..., 3].astype(np.float64) / 255.0
         acc = a + acc * (1.0 - a)
 
-    # Anywhere the composite is short of the artwork, not only where the artwork
-    # is fully opaque.
-    #
-    # The old gate was ``solid``, so a pixel the artist drew at alpha 200 was left
-    # alone however far under it the layers came out. That is a whole band down
-    # the edge of every sheer panel: measured on the leg, the artwork reads 131 to
-    # 249 there and the layers sum to 56 to 199, and no stage touched it -- one is
-    # gated on 250, the other only ever removes opacity. The result is a line
-    # running the length of the shin.
-    #
-    # Matching the artwork's own alpha cannot produce a hard fringe, because the
-    # artwork's alpha *is* the fringe. The reason for a high floor belongs to the
-    # colour repaint, which is a separate step: copying a rim colour drags the
-    # background in, copying a rim *opacity* does not.
-    #
-    # With ``limit_source_alpha`` capping from above, the pair now pins the
-    # composite to the artwork from both sides.
-    # Down to the faintest pixel the artist drew, not just the ones above the
-    # touch floor.
-    #
-    # That floor is 8, and the outermost pixel of an antialiased silhouette is
-    # routinely below it -- measured across the thigh, the artwork reads alpha 5
-    # and 7 there. Skipping them dropped the whole outer pixel of the figure, so
-    # every silhouette came out one pixel harder than it was drawn. Along a leg
-    # that is a continuous line, and it reads as the limb being cut out rather
-    # than painted.
-    #
-    # Reconstructing the artwork's own rim cannot make a hard edge, because that
-    # rim *is* the soft edge.
-    src_norm = src_alpha.astype(np.float64) / 255.0
-    short = (acc < src_norm - 0.5 / 255.0) & (src_alpha > 0)
+    short = solid & (acc < 0.999)
     if not short.any():
         return ordered
 
@@ -991,33 +944,14 @@ def restore_source_alpha(
 
         window_short = short[cy1:cy2, cx1:cx2] & ~fixed[cy1:cy2, cx1:cx2]
         alpha = part.rgba[sy:sy + h, sx:sx + w, 3]
-        # A pixel this part reaches, or is within a pixel of reaching. The strict
-        # "must already have alpha here" test cannot rebuild the outer rim at all:
-        # the pixel the artwork drew at alpha 5 is one the layers missed entirely,
-        # so there is nothing there to raise. One pixel of reach is enough to put
-        # it back and too little to grow the part anywhere it does not belong --
-        # and the value written is the artwork's own, so the silhouette ends up
-        # exactly the shape and softness it was drawn with.
-        reach = ndi.binary_dilation(alpha > 0, ndi.generate_binary_structure(2, 2))
-        target = window_short & reach
+        # Only a pixel this part actually contributes to; raising alpha where it
+        # has none would grow the part into territory it never covered.
+        target = window_short & (alpha > s.source_alpha_touch_floor)
         if not target.any():
             continue
 
         rgba = part.rgba.copy()
         rgba[sy:sy + h, sx:sx + w, 3][target] = src_alpha[cy1:cy2, cx1:cx2][target]
-        # Colour too, wherever the part had nothing here before. Alpha alone is
-        # half a pixel: a rim texel the layers missed carries whatever colour the
-        # part happened to hold there -- bled from somewhere else, or nothing --
-        # and giving it the artwork's opacity without the artwork's colour made
-        # the outer edge worse, not better (peak error 51 -> 147 over the thigh).
-        #
-        # The artwork stores straight alpha, so its RGB at a rim pixel is the
-        # object's own colour; the background's share is carried by the alpha, not
-        # mixed into the channels. Copying it is exact, and only reaches pixels
-        # the part did not previously cover, so nothing already solved is touched.
-        fresh = target & (part.rgba[sy:sy + h, sx:sx + w, 3] == 0)
-        if fresh.any():
-            rgba[sy:sy + h, sx:sx + w, :3][fresh] = src[cy1:cy2, cx1:cx2, :3][fresh]
         fixed[cy1:cy2, cx1:cx2] |= target
         out[i] = Part(
             name=part.name, rgba=rgba, offset=part.offset,

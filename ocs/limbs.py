@@ -614,100 +614,21 @@ def enforce_limb_coverage(
         # Already-sliced parts are eligible sources: after slicing, *every* part
         # has a region, so skipping them left nothing to carve from and the net
         # reported "no_source_layer" for six regions at once.
-        #
-        # Ranked by whether the tag *belongs* in the region first, and only then
-        # by how much of it the part covers. Overlap alone picks whatever happens
-        # to be biggest, and on a seated figure with a long sleeve draped across
-        # her shin that is the sleeve: ``handwear`` covered more of ``leg_r`` than
-        # ``legwear`` did, so the right leg was carved out of the sleeve. The
-        # result is a panel of sleeve fabric standing in for a leg, which then has
-        # to be hidden behind the real leg and shows as a hard-edged strip down
-        # the shin wherever it sticks out.
-        #
-        # ``allowed_regions`` is the same table that keeps the ordinary partition
-        # from putting a leg layer on an arm; it belongs here too. A disallowed
-        # tag is still accepted if nothing allowed overlaps at all, because
-        # requirement 2-2 is unconditional.
-        # If a layer already *is* this region, label it and carve nothing.
-        #
-        # ``legwear`` on this character lies 99.6% inside ``leg_r`` -- it is the
-        # right leg. Cutting a second piece out of something else to stand in for
-        # it produces geometry nobody needed: the skirt got carved instead,
-        # binding half of it to the leg bone and leaving the source it came from
-        # as a 25x10 sliver. Renaming costs nothing and keeps the layer whole.
-        adopted = None
-        for p in out:
-            if p.region is not None or p.tag in _HEAD_TAGS:
-                continue
-            mask = p.canvas_mask(decomp.canvas)
-            area = int(mask.sum())
-            if area <= 0:
-                continue
-            allowed = taxonomy.allowed_regions(p.tag, p.side)
-            if allowed is not None and not (
-                    region in allowed
-                    or any(taxonomy.merged_region_of(a) == region for a in allowed)):
-                continue
-            overlap = int((mask & target_mask).sum())
-            share = overlap / area
-            # Among the layers that qualify, the one that covers the most of the
-            # region -- not the one with the highest share. A foot sits 100%
-            # inside ``leg_r`` and would win on share alone, and a foot is not a
-            # leg; ``legwear`` at 99.6% covers nearly three times as much of it.
-            if share >= s.adopt_region_share and (
-                    adopted is None or overlap > adopted[0]):
-                adopted = (overlap, share, p)
-        if adopted is not None:
-            _overlap, share, source = adopted
-            naming = taxonomy.PartNaming()
-            renamed = Part(
-                name=naming.garment(source.name, region), rgba=source.rgba,
-                offset=source.offset, depth_median=source.depth_median,
-                depth=source.depth, synthetic=source.synthetic,
-                meta={**source.meta, "region": region, "adopted": True},
-            )
-            out[out.index(source)] = renamed
-            report["forced"].append({
-                "region": region, "adopted": source.name,
-                "share": round(share, 3),
-            })
-            continue
-
-        best: tuple[int, float, Part] | None = None
+        best: tuple[int, Part] | None = None
         for p in out:
             if p.region == region:
                 continue
             if p.tag in _HEAD_TAGS:
                 continue  # head parts never belong to a limb
-            mask = p.canvas_mask(decomp.canvas)
-            overlap = int((mask & target_mask).sum())
-            if overlap <= 0:
-                continue
-            allowed = taxonomy.allowed_regions(p.tag, p.side)
-            # The mandatory regions are the *merged* names when slices are merged,
-            # while allowed_regions lists segments, so ``leg_r`` never matches
-            # ``leg_r_upper`` directly. Compare through the merge.
-            fits = 1 if allowed is None else int(
-                region in allowed
-                or any(taxonomy.merged_region_of(a) == region for a in allowed))
-            # Weighted by how much of the *part* lies in the region, not just how
-            # much of the region it covers. Raw overlap asks "what is biggest
-            # here", and the biggest thing over a raised shin is a skirt that
-            # merely passes across it -- carving from that bound half the skirt to
-            # the leg bone and left the source as a 25x10 sliver. Weighting asks
-            # "what actually *is* this region", which is the layer that lives
-            # there: on this character ``legwear`` is 99.6% inside ``leg_r``,
-            # against 66.5% for the sleeve and 12.8% for the skirt's torso piece.
-            share = overlap / max(int(mask.sum()), 1)
-            rank = (fits, overlap * share)
-            if best is None or rank > (best[0], best[1]):
-                best = (fits, overlap * share, p)
+            overlap = int((p.canvas_mask(decomp.canvas) & target_mask).sum())
+            if overlap > 0 and (best is None or overlap > best[0]):
+                best = (overlap, p)
 
         if best is None:
             report["forced"].append({"region": region, "reason": "no_source_layer"})
             continue
 
-        _fits, _score, source = best
+        overlap, source = best
         src_mask = source.canvas_mask(decomp.canvas)
         carve = src_mask & target_mask
         remainder = src_mask & ~target_mask
