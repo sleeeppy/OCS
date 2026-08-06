@@ -908,16 +908,17 @@ def restore_source_alpha(
     it is the part you see, the artwork says the pixel is solid, and raising it
     changes nothing anywhere the reconstruction was already opaque.
 
-    Only where the source is genuinely solid. The character's own soft outline is
-    partly transparent in the artwork too, and must stay that way or the silhouette
-    gains a hard fringe.
+    Up to the artwork's own alpha, whatever that is -- not only where the artwork
+    is fully opaque. Matching it cannot produce a hard fringe, because the
+    artwork's alpha *is* the fringe. The reason a high floor exists belongs to the
+    colour repaint instead: copying a rim's colour drags the background inward,
+    copying a rim's opacity does not.
     """
     if decomp.src_img is None or decomp.src_img.shape[2] < 4:
         return ordered
 
     cw, ch = decomp.canvas
     src_alpha = decomp.src_img[..., 3]
-    solid = src_alpha >= s.source_alpha_solid_floor
 
     # Composite alpha of everything, which is order-independent.
     acc = np.zeros((ch, cw), np.float64)
@@ -925,7 +926,25 @@ def restore_source_alpha(
         a = part.canvas_rgba(decomp.canvas)[..., 3].astype(np.float64) / 255.0
         acc = a + acc * (1.0 - a)
 
-    short = solid & (acc < 0.999)
+    # Anywhere the composite is short of the artwork, not only where the artwork
+    # is fully opaque.
+    #
+    # The old gate was ``solid``, so a pixel the artist drew at alpha 200 was left
+    # alone however far under it the layers came out. That is a whole band down
+    # the edge of every sheer panel: measured on the leg, the artwork reads 131 to
+    # 249 there and the layers sum to 56 to 199, and no stage touched it -- one is
+    # gated on 250, the other only ever removes opacity. The result is a line
+    # running the length of the shin.
+    #
+    # Matching the artwork's own alpha cannot produce a hard fringe, because the
+    # artwork's alpha *is* the fringe. The reason for a high floor belongs to the
+    # colour repaint, which is a separate step: copying a rim colour drags the
+    # background in, copying a rim *opacity* does not.
+    #
+    # With ``limit_source_alpha`` capping from above, the pair now pins the
+    # composite to the artwork from both sides.
+    src_norm = src_alpha.astype(np.float64) / 255.0
+    short = (acc < src_norm - 1.0 / 255.0) & (src_alpha > s.source_alpha_touch_floor)
     if not short.any():
         return ordered
 

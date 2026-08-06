@@ -1253,3 +1253,51 @@ def test_a_hand_resting_on_a_garment_is_not_welded_to_it(figure):
             assert not (used & leg_bones), f"{slot.name} is driven by {used & leg_bones}"
         if tag == "bottomwear" and region.startswith("leg"):
             assert not (used & arm_bones), f"{slot.name} is driven by {used & arm_bones}"
+
+
+def test_the_composite_matches_the_artwork_s_alpha_at_every_opacity(figure):
+    """Not just where the artwork is opaque -- the soft band needs it most.
+
+    ``restore_source_alpha`` was gated on the artwork being fully solid, so a
+    pixel the artist drew at alpha 200 was left alone however far under it the
+    layers came out, and ``limit_source_alpha`` only ever removes opacity. That
+    left a band nobody owned. Measured down the shin, where a sheer panel crosses
+    bare skin: the artwork reads 131 to 249 and the layers summed to 56 to 199,
+    which renders as a line the length of the leg.
+
+    Matching the artwork's alpha cannot make a hard fringe, because the artwork's
+    alpha *is* the fringe. The two functions now pin the composite from both
+    sides.
+    """
+    import numpy as np
+
+    from ocs import rig as rig_mod
+    from ocs.config import RigSettings
+
+    reports = cleanup.analyze(figure)
+    kept, _ = cleanup.apply_verdicts(figure, reports)
+    rig = skeleton.guess_rig(figure, kept)
+    parts, _ = limbs.partition(figure, kept, rig, RigSettings())
+    built = rig_mod.build_rig(figure, parts, rig, RigSettings())
+
+    acc = np.zeros(figure.canvas[::-1], np.float64)
+    for slot in built.slots:
+        a = built.part_images[slot.name].canvas_rgba(figure.canvas)[..., 3] / 255.0
+        acc = a + acc * (1.0 - a)
+
+    src = figure.src_img[..., 3].astype(np.float64) / 255.0
+    # Only where some part actually reaches; the pipeline never invents coverage.
+    reachable = np.zeros_like(acc, dtype=bool)
+    for slot in built.slots:
+        reachable |= built.part_images[slot.name].canvas_rgba(figure.canvas)[..., 3] > 8
+
+    soft = reachable & (src > 8 / 255.0) & (src < 250 / 255.0)
+    if not soft.any():
+        import pytest
+        pytest.skip("fixture has no semi-transparent artwork")
+
+    short = (src - acc)[soft]
+    worst = float(short.max() * 255)
+    assert worst < 24, (
+        f"the composite falls {worst:.0f} levels below the artwork in its soft "
+        "band, which draws a line wherever that band is narrow")
