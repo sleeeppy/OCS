@@ -309,3 +309,58 @@ def test_a_forced_limb_region_is_carved_from_a_layer_that_belongs_there():
         "the case is meant to have the wrong layer covering more of the region"
     assert best[2].name == "legwear", (
         f"carved leg_r out of {best[2].name}; overlap alone would pick the sleeve")
+
+
+def test_a_region_adopts_a_layer_that_already_is_it():
+    """Requirement 2-2 does not need new geometry when a layer already fits.
+
+    ``enforce_limb_coverage`` carved a mandatory region out of whichever layer
+    covered it most. On this character ``legwear`` lies 99.6% inside ``leg_r`` --
+    it *is* the right leg -- yet the carve went to whatever was biggest across
+    that area instead: first the sleeve draped over the shin, and after that was
+    excluded, the skirt. Cutting a stand-in out of the skirt bound half of it to
+    the leg bone and left its own source as a 25x10 sliver, and the thigh met the
+    skirt at a hard edge.
+
+    So a region adopts a layer that is already almost entirely inside it, and
+    carves only when nothing qualifies. Among the layers that qualify it takes the
+    one covering the most of the region, not the highest share: a foot sits 100%
+    inside ``leg_r`` and a foot is not a leg.
+    """
+    import numpy as np
+
+    from ocs.config import RigSettings
+    from ocs.psd_io import Decomposition, Part
+
+    def block(x0, y0, x1, y1, rgb):
+        a = np.zeros((256, 256, 4), np.uint8)
+        a[y0:y1, x0:x1] = (*rgb, 255)
+        return a
+
+    target = np.zeros((256, 256), bool)
+    target[90:240, 55:105] = True
+
+    leg = Part(name="legwear", rgba=block(58, 92, 102, 238, (230, 200, 180)),
+               offset=(0, 0))
+    foot = Part(name="footwear-r", rgba=block(60, 210, 100, 238, (90, 40, 40)),
+                offset=(0, 0))
+    skirt = Part(name="bottomwear", rgba=block(40, 80, 200, 250, (200, 60, 60)),
+                 offset=(0, 0))
+    decomp = Decomposition(canvas=(256, 256), parts=[leg, foot, skirt])
+    s = RigSettings()
+
+    def share(p):
+        m = p.canvas_mask(decomp.canvas)
+        return int((m & target).sum()) / max(int(m.sum()), 1)
+
+    assert share(leg) >= s.adopt_region_share, "the leg should qualify"
+    assert share(foot) >= s.adopt_region_share, "the foot qualifies on share too"
+    assert share(skirt) < s.adopt_region_share, "the skirt should not qualify"
+
+    def overlap(p):
+        return int((p.canvas_mask(decomp.canvas) & target).sum())
+
+    winner = max((p for p in (leg, foot, skirt) if share(p) >= s.adopt_region_share),
+                 key=overlap)
+    assert winner.name == "legwear", (
+        f"adopted {winner.name}; the foot wins on share and must not")

@@ -628,13 +628,59 @@ def enforce_limb_coverage(
         # from putting a leg layer on an arm; it belongs here too. A disallowed
         # tag is still accepted if nothing allowed overlaps at all, because
         # requirement 2-2 is unconditional.
-        best: tuple[int, int, Part] | None = None
+        # If a layer already *is* this region, label it and carve nothing.
+        #
+        # ``legwear`` on this character lies 99.6% inside ``leg_r`` -- it is the
+        # right leg. Cutting a second piece out of something else to stand in for
+        # it produces geometry nobody needed: the skirt got carved instead,
+        # binding half of it to the leg bone and leaving the source it came from
+        # as a 25x10 sliver. Renaming costs nothing and keeps the layer whole.
+        adopted = None
+        for p in out:
+            if p.region is not None or p.tag in _HEAD_TAGS:
+                continue
+            mask = p.canvas_mask(decomp.canvas)
+            area = int(mask.sum())
+            if area <= 0:
+                continue
+            allowed = taxonomy.allowed_regions(p.tag, p.side)
+            if allowed is not None and not (
+                    region in allowed
+                    or any(taxonomy.merged_region_of(a) == region for a in allowed)):
+                continue
+            overlap = int((mask & target_mask).sum())
+            share = overlap / area
+            # Among the layers that qualify, the one that covers the most of the
+            # region -- not the one with the highest share. A foot sits 100%
+            # inside ``leg_r`` and would win on share alone, and a foot is not a
+            # leg; ``legwear`` at 99.6% covers nearly three times as much of it.
+            if share >= s.adopt_region_share and (
+                    adopted is None or overlap > adopted[0]):
+                adopted = (overlap, share, p)
+        if adopted is not None:
+            _overlap, share, source = adopted
+            naming = taxonomy.PartNaming()
+            renamed = Part(
+                name=naming.garment(source.name, region), rgba=source.rgba,
+                offset=source.offset, depth_median=source.depth_median,
+                depth=source.depth, synthetic=source.synthetic,
+                meta={**source.meta, "region": region, "adopted": True},
+            )
+            out[out.index(source)] = renamed
+            report["forced"].append({
+                "region": region, "adopted": source.name,
+                "share": round(share, 3),
+            })
+            continue
+
+        best: tuple[int, float, Part] | None = None
         for p in out:
             if p.region == region:
                 continue
             if p.tag in _HEAD_TAGS:
                 continue  # head parts never belong to a limb
-            overlap = int((p.canvas_mask(decomp.canvas) & target_mask).sum())
+            mask = p.canvas_mask(decomp.canvas)
+            overlap = int((mask & target_mask).sum())
             if overlap <= 0:
                 continue
             allowed = taxonomy.allowed_regions(p.tag, p.side)
@@ -644,15 +690,24 @@ def enforce_limb_coverage(
             fits = 1 if allowed is None else int(
                 region in allowed
                 or any(taxonomy.merged_region_of(a) == region for a in allowed))
-            rank = (fits, overlap)
+            # Weighted by how much of the *part* lies in the region, not just how
+            # much of the region it covers. Raw overlap asks "what is biggest
+            # here", and the biggest thing over a raised shin is a skirt that
+            # merely passes across it -- carving from that bound half the skirt to
+            # the leg bone and left the source as a 25x10 sliver. Weighting asks
+            # "what actually *is* this region", which is the layer that lives
+            # there: on this character ``legwear`` is 99.6% inside ``leg_r``,
+            # against 66.5% for the sleeve and 12.8% for the skirt's torso piece.
+            share = overlap / max(int(mask.sum()), 1)
+            rank = (fits, overlap * share)
             if best is None or rank > (best[0], best[1]):
-                best = (fits, overlap, p)
+                best = (fits, overlap * share, p)
 
         if best is None:
             report["forced"].append({"region": region, "reason": "no_source_layer"})
             continue
 
-        _fits, overlap, source = best
+        _fits, _score, source = best
         src_mask = source.canvas_mask(decomp.canvas)
         carve = src_mask & target_mask
         remainder = src_mask & ~target_mask

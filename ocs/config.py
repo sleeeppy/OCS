@@ -160,6 +160,13 @@ class RigSettings:
     #: A partition slice smaller than this fraction of the source layer is
     #: discarded rather than emitted as a sliver attachment.
     min_slice_fraction: float = 0.02
+    #: How much of a layer must already lie inside a mandatory limb region before
+    #: the region simply adopts it instead of carving a stand-in out of something
+    #: else. ``legwear`` sits 99.6% inside ``leg_r``; it *is* the right leg, and
+    #: cutting a second piece out of the skirt to stand in for it bound half the
+    #: skirt to the leg bone and left its source as a 25x10 sliver.
+    #: See ``limbs.enforce_limb_coverage``.
+    adopt_region_share: float = 0.85
     #: Repaint each part's *visible* pixels from the original artwork.
     #:
     #: see-through regenerates every layer with a diffusion model rather than
