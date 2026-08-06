@@ -372,6 +372,35 @@ def _osc(
     return tuple(frames)
 
 
+def _breathe_arms(
+    bones: dict[str, dict], available: set[str], loop: float, amplitude: float,
+    *, lag: float = 0.08, cycles: int = 1, samples: int = 8,
+) -> None:
+    """Give the arms a share of the breath, lagged and unmirrored.
+
+    Arms were left out entirely while the resting hands were pinned to a pixel,
+    and a body whose chest rises while both arms stay welded reads as a
+    photograph with one moving part. ``limb_swing_caps`` scales whatever is asked
+    for down to what the pose allows, so a resting arm still ends up small -- the
+    point is that it is no longer zero.
+
+    The elbow trails the shoulder and takes about two thirds of it, which is what
+    a limb hanging off a moving trunk does, and the two sides differ so the figure
+    is not symmetric about its own spine.
+    """
+    bias = {"left": 1.0, "right": 0.78}
+    for side in ("left", "right"):
+        arm, elbow = f"{side}Arm", f"{side}Elbow"
+        if arm in available:
+            bones[arm] = {"rotate": _rot(*_osc(
+                _sym(side, amplitude) * bias[side], loop,
+                lag=lag, cycles=cycles, skew=0.25, samples=samples))}
+        if elbow in available:
+            bones[elbow] = {"rotate": _rot(*_osc(
+                _sym(side, amplitude * 0.66) * bias[side], loop,
+                lag=lag + 0.05, cycles=cycles, skew=0.25, samples=samples))}
+
+
 def _idle_breath(available: set[str]) -> dict:
     """Quiet breathing, 4.2 s. The one to use when nothing else is happening.
 
@@ -384,14 +413,15 @@ def _idle_breath(available: set[str]) -> dict:
     loop = 4.2
     bones: dict[str, dict] = {}
     if "torso" in available:
-        rise = _osc(1.6, loop, skew=0.38)
-        bones["torso"] = {"translate": _trans(*[(t, 0.0, v + 1.6) for t, v in rise])}
+        rise = _osc(3.4, loop, skew=0.38)
+        bones["torso"] = {"translate": _trans(*[(t, 0.0, v + 3.4) for t, v in rise])}
     if "neck" in available:
-        bones["neck"] = {"rotate": _rot(*_osc(0.9, loop, lag=0.05, skew=0.32))}
+        bones["neck"] = {"rotate": _rot(*_osc(1.9, loop, lag=0.05, skew=0.32))}
     if "head" in available:
-        bones["head"] = {"rotate": _rot(*_osc(0.7, loop, lag=0.10, skew=0.32))}
+        bones["head"] = {"rotate": _rot(*_osc(1.5, loop, lag=0.10, skew=0.32))}
     if "hairBack" in available:
-        bones["hairBack"] = {"rotate": _rot(*_osc(1.9, loop, lag=0.19))}
+        bones["hairBack"] = {"rotate": _rot(*_osc(4.2, loop, lag=0.19))}
+    _breathe_arms(bones, available, loop, 3.4, lag=0.08)
     return {"bones": bones}
 
 
@@ -407,20 +437,21 @@ def _idle_settle(available: set[str]) -> dict:
     loop = 7.5
     bones: dict[str, dict] = {}
     if "torso" in available:
-        breath = _osc(1.3, loop, cycles=2, skew=0.4, samples=12)
-        drift = _osc(0.9, loop, lag=0.28, samples=12)
+        breath = _osc(2.8, loop, cycles=2, skew=0.4, samples=12)
+        drift = _osc(2.0, loop, lag=0.28, samples=12)
         bones["torso"] = {"translate": _trans(
-            *[(t, drift[i][1] * 0.8, v + 1.3) for i, (t, v) in enumerate(breath)])}
+            *[(t, drift[i][1] * 0.8, v + 2.8) for i, (t, v) in enumerate(breath)])}
     if "neck" in available:
-        bones["neck"] = {"rotate": _rot(*_osc(0.6, loop, lag=0.06, cycles=2,
+        bones["neck"] = {"rotate": _rot(*_osc(1.3, loop, lag=0.06, cycles=2,
                                               skew=0.35, samples=12))}
     if "head" in available:
-        fast = _osc(0.45, loop, lag=0.12, cycles=2, skew=0.35, samples=12)
-        slow = _osc(0.8, loop, lag=0.33, samples=12)
+        fast = _osc(1.0, loop, lag=0.12, cycles=2, skew=0.35, samples=12)
+        slow = _osc(1.7, loop, lag=0.33, samples=12)
         bones["head"] = {"rotate": _rot(
             *[(t, v + slow[i][1]) for i, (t, v) in enumerate(fast)])}
     if "hairBack" in available:
-        bones["hairBack"] = {"rotate": _rot(*_osc(1.4, loop, lag=0.22, samples=12))}
+        bones["hairBack"] = {"rotate": _rot(*_osc(3.1, loop, lag=0.22, samples=12))}
+    _breathe_arms(bones, available, loop, 2.6, lag=0.09, cycles=2, samples=12)
     return {"bones": bones}
 
 
@@ -436,8 +467,8 @@ def _idle_glance(available: set[str]) -> dict:
     loop = 6.0
     bones: dict[str, dict] = {}
     if "torso" in available:
-        rise = _osc(1.4, loop, cycles=2, skew=0.36, samples=12)
-        bones["torso"] = {"translate": _trans(*[(t, 0.0, v + 1.4) for t, v in rise])}
+        rise = _osc(3.0, loop, cycles=2, skew=0.36, samples=12)
+        bones["torso"] = {"translate": _trans(*[(t, 0.0, v + 3.0) for t, v in rise])}
     if "eyes" in available:
         bones["eyes"] = {"translate": _trans(
             (0, 0, 0), (0.9, 0, 0), (1.35, 2.9, 0), (2.5, 2.6, 0), (2.9, 0, 0),
@@ -445,18 +476,19 @@ def _idle_glance(available: set[str]) -> dict:
         )}
     if "head" in available:
         bones["head"] = {"rotate": _rot(
-            (0, 0), (1.0, 0.3), (1.5, 2.1), (2.5, 1.9), (3.1, 0.2),
-            (3.7, -0.2), (4.15, -1.6), (4.9, -1.4), (5.5, 0.1), (6.0, 0),
+            (0, 0), (1.0, 0.6), (1.5, 4.4), (2.5, 4.0), (3.1, 0.4),
+            (3.7, -0.4), (4.15, -3.4), (4.9, -3.0), (5.5, 0.2), (6.0, 0),
         )}
     if "neck" in available:
         bones["neck"] = {"rotate": _rot(
-            (0, 0), (1.1, 0.2), (1.65, 0.9), (2.6, 0.8), (3.2, 0.1),
-            (3.85, -0.1), (4.3, -0.7), (5.0, -0.6), (5.6, 0), (6.0, 0),
+            (0, 0), (1.1, 0.4), (1.65, 2.0), (2.6, 1.8), (3.2, 0.2),
+            (3.85, -0.2), (4.3, -1.5), (5.0, -1.3), (5.6, 0), (6.0, 0),
         )}
     if "hairBack" in available:
         bones["hairBack"] = {"rotate": _rot(
-            (0, 0), (1.8, -1.5), (2.8, 0.6), (4.4, 1.3), (5.3, -0.5), (6.0, 0),
+            (0, 0), (1.8, -3.3), (2.8, 1.3), (4.4, 2.9), (5.3, -1.1), (6.0, 0),
         )}
+    _breathe_arms(bones, available, loop, 2.8, lag=0.1, cycles=2, samples=12)
     return {"bones": bones}
 
 
@@ -472,16 +504,17 @@ def _idle_sway(available: set[str]) -> dict:
     loop = 5.4
     bones: dict[str, dict] = {}
     if "torso" in available:
-        side = _osc(1.5, loop, skew=0.2, samples=12)
-        rise = _osc(1.1, loop, cycles=2, lag=0.1, skew=0.36, samples=12)
+        side = _osc(3.6, loop, skew=0.2, samples=12)
+        rise = _osc(2.2, loop, cycles=2, lag=0.1, skew=0.36, samples=12)
         bones["torso"] = {"translate": _trans(
-            *[(t, v, rise[i][1] + 1.1) for i, (t, v) in enumerate(side)])}
+            *[(t, v, rise[i][1] + 2.2) for i, (t, v) in enumerate(side)])}
     if "neck" in available:
-        bones["neck"] = {"rotate": _rot(*_osc(-1.0, loop, lag=0.07, samples=12))}
+        bones["neck"] = {"rotate": _rot(*_osc(-2.2, loop, lag=0.07, samples=12))}
     if "head" in available:
-        bones["head"] = {"rotate": _rot(*_osc(-0.8, loop, lag=0.13, samples=12))}
+        bones["head"] = {"rotate": _rot(*_osc(-1.7, loop, lag=0.13, samples=12))}
     if "hairBack" in available:
-        bones["hairBack"] = {"rotate": _rot(*_osc(3.2, loop, lag=0.26, samples=12))}
+        bones["hairBack"] = {"rotate": _rot(*_osc(6.8, loop, lag=0.26, samples=12))}
+    _breathe_arms(bones, available, loop, 4.5, lag=0.11, samples=12)
     return {"bones": bones}
 
 
@@ -498,36 +531,37 @@ def _idle_sigh(available: set[str]) -> dict:
     bones: dict[str, dict] = {}
     if "torso" in available:
         bones["torso"] = {"translate": _trans(
-            (0, 0, 0), (0.5, 0, 1.4), (1.5, 0, 3.4), (2.0, 0, 3.1),
-            (3.4, 0, 0.9), (4.4, 0, -0.5), (5.1, 0, -0.2), (5.6, 0, 0),
+            (0, 0, 0), (0.5, 0, 3.0), (1.5, 0, 7.2), (2.0, 0, 6.6),
+            (3.4, 0, 1.9), (4.4, 0, -1.1), (5.1, 0, -0.4), (5.6, 0, 0),
         )}
     if "neck" in available:
         bones["neck"] = {"rotate": _rot(
-            (0, 0), (0.7, 0.9), (1.7, 1.8), (2.3, 1.5),
-            (3.7, 0.3), (4.6, -0.6), (5.2, -0.2), (5.6, 0),
+            (0, 0), (0.7, 1.9), (1.7, 3.8), (2.3, 3.2),
+            (3.7, 0.6), (4.6, -1.3), (5.2, -0.4), (5.6, 0),
         )}
     if "head" in available:
         bones["head"] = {"rotate": _rot(
-            (0, 0), (0.9, 0.7), (1.9, 1.5), (2.5, 1.2),
-            (3.9, 0.1), (4.8, -0.9), (5.3, -0.3), (5.6, 0),
+            (0, 0), (0.9, 1.5), (1.9, 3.2), (2.5, 2.6),
+            (3.9, 0.2), (4.8, -1.9), (5.3, -0.6), (5.6, 0),
         )}
     if "hairBack" in available:
         bones["hairBack"] = {"rotate": _rot(
-            (0, 0), (1.2, -1.2), (2.4, 1.0), (3.2, 1.6),
-            (4.3, -0.8), (5.1, 0.4), (5.6, 0),
+            (0, 0), (1.2, -2.6), (2.4, 2.1), (3.2, 3.4),
+            (4.3, -1.7), (5.1, 0.9), (5.6, 0),
         )}
+    _breathe_arms(bones, available, loop, 4.0, lag=0.12, samples=12)
     return {"bones": bones}
 
 
 #: Cloth settings per animation: (loop seconds, amplitude px, cycles, phase lag).
 #: The loop must match the preset's own, or the fabric and the body drift apart.
 CLOTH_MOTION = {
-    "idle":        (3.6, 4.5, 1, 0.20),
-    "idle_breath": (4.2, 5.0, 1, 0.22),
-    "idle_settle": (7.5, 4.0, 2, 0.25),
-    "idle_glance": (6.0, 4.5, 2, 0.18),
-    "idle_sway":   (5.4, 9.0, 1, 0.28),
-    "idle_sigh":   (5.6, 7.0, 1, 0.24),
+    "idle":        (3.6,  7.5, 1, 0.20),
+    "idle_breath": (4.2,  8.5, 1, 0.22),
+    "idle_settle": (7.5,  6.5, 2, 0.25),
+    "idle_glance": (6.0,  7.5, 2, 0.18),
+    "idle_sway":   (5.4, 15.0, 1, 0.28),
+    "idle_sigh":   (5.6, 12.0, 1, 0.24),
 }
 
 
@@ -631,38 +665,16 @@ def limb_swing_caps(rig: RigResult) -> dict[str, float]:
             caps[elbow] = directional(
                 elbow, clearance, dist(elbow, hand) or length / 2.0)
 
-    # --- limbs that are resting on something ------------------------------
+    # A resting limb is no longer pinned. Holding the hands to a pixel kept the
+    # painted contact shadow perfectly aligned, but it welded the sleeves to the
+    # body and the figure read as a photograph with a breathing chest. The limit
+    # that matters is the seam coming apart, not the shadow drifting, and the
+    # directional caps above already stop a limb swinging into the body.
     #
-    # A hand lying on a skirt or propping up a chin cannot drift, and moving it
-    # a little is worse than not moving it at all. The artwork has the contact
-    # painted in -- the shadow the hand casts, the fabric compressed under it --
-    # and every bit of that belongs to the layer underneath, which travels with a
-    # different bone. Slide the hand and it leaves its own shadow behind, so you
-    # see the hand's edge and a second copy of it a few pixels away. That is the
-    # outline that trails the arm.
-    #
-    # It takes very little movement. The idle swings ``leftArm`` 2.2 deg over a
-    # 498 px arm, so the hand crosses 19 px of skirt whose painted shadow crosses
-    # none. Differencing two frames of the idle shows the whole forearm and hand
-    # lit up against a skirt that barely moved.
-    #
-    # This is a constraint from the rig, not a change to the gesture: the presets
-    # are untouched and every free limb keeps its full swing. Only a limb whose
-    # tip is *measured* to be resting on another part is held still.
-    for bone, tip in _planted_tips(rig):
-        # Derived from the limb, not picked: whatever angle moves the tip by one
-        # pixel. Not zero, because an arm frozen solid on a breathing body reads
-        # as pinned, and not a fixed number of degrees, because the same angle
-        # moves a 498 px arm five times as far as a 91 px one.
-        reach = dist(bone, tip)
-        limit = (math.degrees(_PLANTED_TRAVEL_PX / reach)
-                 if reach > _PLANTED_TRAVEL_PX else 180.0)
-        caps[bone] = (limit, limit)
+    # ``_planted_tips`` stays, because ``cloth_deform`` still needs to know where
+    # the fabric is held: a ripple running through the hand pulls it away from its
+    # own shadow far faster than the arm rotating does.
     return caps
-
-
-#: How far the tip of a resting limb may travel, in pixels.
-_PLANTED_TRAVEL_PX = 1.0
 
 
 def _planted_tips(rig: RigResult) -> list[tuple[str, str]]:

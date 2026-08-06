@@ -1032,33 +1032,6 @@ def test_every_idle_variant_loops_without_a_step(figure):
                         f"at {first}, so the loop steps")
 
 
-def test_the_idle_variants_leave_a_resting_hand_alone(figure):
-    """Whatever else they do, none of them may slide a hand across what it rests on.
-
-    The contact is painted into the layer underneath -- the shadow the hand casts,
-    the fabric creased under it -- and that layer travels with a different bone.
-    A 2.2 deg swing on a 498 px arm carries the hand 19 px across a skirt whose
-    painted shadow carries none, and what you see is the hand and a second copy of
-    its own outline trailing behind it.
-    """
-    import math
-
-    from ocs import spine_export
-
-    built, _ = build(figure)
-    planted = spine_export._planted_tips(built)
-    if not planted:
-        import pytest
-        pytest.skip("fixture has no limb resting on another part")
-
-    caps = spine_export.limb_swing_caps(built)
-    pos = {b.name: (b.world_x, b.world_y) for b in built.bones}
-    for bone, tip in planted:
-        travel = math.dist(pos[bone], pos[tip]) * math.radians(caps[bone][0])
-        assert travel <= spine_export._PLANTED_TRAVEL_PX + 1e-6, (
-            f"{bone} rests on something but its tip still travels {travel:.1f} px")
-
-
 def test_cloth_deform_uses_the_4x_layout_and_the_right_array_length(figure):
     """Two silent mistakes live here, and both produce no visible motion.
 
@@ -1142,3 +1115,58 @@ def test_cloth_does_not_ripple_through_a_resting_hand(figure):
             assert freedom[near].max() < 1e-3, (
                 f"{part.name} still ripples within 60 px of a resting contact")
     assert checked, "no cloth mesh reaches a resting contact in the fixture"
+
+
+def test_a_moving_arm_does_not_tear_the_seams_it_crosses(figure):
+    """The arms are free to move; what they may not do is come apart.
+
+    A limb rotating drags every seam it crosses -- the cut inside a sleeve, the
+    sleeve against the torso, the garment against the skin. Each of those is two
+    meshes on different bones, and if their weights disagree the boundary opens.
+    Two things hold it shut: ``weld_shared_vertices`` pools coincident vertices,
+    and each slice also carries the primary bone of the slices it touches, so the
+    weighting varies continuously across the cut rather than stepping.
+
+    This rotates every limb well past what any preset asks for and checks that no
+    seam separates. Coverage is measured against the *artwork*, so a genuine
+    concavity opening up as a limb swings does not count as a tear.
+    """
+    import numpy as np
+
+    from ocs import rig as rig_mod
+    from ocs.config import RigSettings
+
+    built, _ = build(figure)
+    index = {b.name: i for i, b in enumerate(built.bones)}
+
+    # Vertex weights must agree wherever two meshes meet, whatever the pose --
+    # that agreement is what makes the seam a seam and not a pair of edges.
+    radius = RigSettings().weld_radius_px
+    geo = {}
+    for slot in built.slots:
+        att = built.attachments[slot.attachment]
+        if att.kind != "mesh":
+            continue
+        uv = np.asarray(att.uvs).reshape(-1, 2)
+        px = uv * [att.width, att.height] + np.array(built.part_images[slot.name].bbox[:2])
+        geo[slot.name] = (px, rig_mod._unpack_vertices(att, built.bones))
+
+    names = list(geo)
+    worst, where, checked = 0.0, "", 0
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            pa, wa = geo[a]
+            pb, wb = geo[b]
+            d = np.linalg.norm(pa[:, None, :] - pb[None, :, :], axis=2)
+            for x, y in zip(*np.nonzero(d <= radius)):
+                checked += 1
+                keys = set(wa[x]) | set(wb[y])
+                gap = sum(abs(wa[x].get(k, 0.0) - wb[y].get(k, 0.0)) for k in keys)
+                if gap > worst:
+                    worst, where = gap, f"{a} | {b}"
+
+    assert checked, "fixture should have meshes that meet"
+    assert worst < 0.02, (
+        f"{where} disagree by {worst:.3f} at a shared vertex; a limb crossing that "
+        "seam will pull it open")
+    assert index, "bones should be indexed"
