@@ -10,7 +10,7 @@ The libgdx ``.atlas`` format Spine consumes:
     skeleton.png
     size: 1024, 2048
     format: RGBA8888
-    filter: Linear, Linear
+    filter: MipMapLinearLinear, Linear
     repeat: none
     region_name
       rotate: false
@@ -68,7 +68,8 @@ class AtlasResult:
             png_name,
             f"size: {self.size[0]}, {self.size[1]}",
             "format: RGBA8888",
-            "filter: Linear, Linear",
+            # Minified, so the page needs mipmaps. See ``_MIN_FILTER``.
+            f"filter: {_MIN_FILTER}, Linear",
             "repeat: none",
             # The page is premultiplied. See ``_premultiply``.
             "pma: true",
@@ -84,6 +85,28 @@ class AtlasResult:
                 "  index: -1",
             ]
         return "\n".join(lines) + "\n"
+
+
+#: Minification filter written into the page header.
+#:
+#: The preview fits a ~1000 unit skeleton into a canvas a few hundred pixels
+#: high, so the atlas is *minified* -- measured at 0.765 on this character. A
+#: plain ``Linear`` filter takes four texels per output pixel however large the
+#: footprint is, so at any scale under 1 it undersamples: thin high-contrast
+#: features -- the one-pixel rim along an arm, a gold hem -- collapse into a hard
+#: line instead of averaging away, and because which texels get hit depends on
+#: the sub-pixel position, that line crawls as the limb moves. It reads as an
+#: outline trailing the arm.
+#:
+#: This is not the same defect as filtering straight alpha, which ``_premultiply``
+#: fixes; that one is about interpolating the wrong quantity, this one is about
+#: not taking enough samples. Premultiplying does nothing for it, which is why it
+#: survived that fix, and it is invisible at any zoom above 1:1, which is why it
+#: never showed up in a close-up.
+#:
+#: Mipmaps give the sampler a correctly pre-averaged level to read. The runtime
+#: generates them; the header is what asks for them.
+_MIN_FILTER = "MipMapLinearLinear"
 
 
 def _premultiply(rgba: np.ndarray) -> np.ndarray:

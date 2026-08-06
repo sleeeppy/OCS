@@ -910,3 +910,41 @@ def test_a_limb_resting_on_something_barely_moves(figure):
         travel = reach * math.radians(caps[bone][0])
         assert travel <= spine_export._PLANTED_TRAVEL_PX + 1e-6, (
             f"{bone} rests on something but its tip still travels {travel:.1f} px")
+
+
+def test_the_atlas_asks_for_mipmaps(figure):
+    """The page is minified in the preview, so it needs pre-averaged levels.
+
+    The player fits a ~1000 unit skeleton into a canvas a few hundred pixels
+    high -- measured at 0.765 on this character -- so the atlas is sampled
+    *below* 1:1. A plain ``Linear`` filter reads four texels per output pixel
+    whatever the footprint is, so under 1:1 it undersamples: thin high-contrast
+    features, the one-pixel rim along an arm or a gold hem, collapse into a hard
+    line instead of averaging away, and which texels get hit depends on the
+    sub-pixel position, so the line crawls as the limb moves. That is the outline
+    seen trailing the arm.
+
+    It is a different defect from filtering straight alpha, which ``_premultiply``
+    fixes -- that one interpolates the wrong quantity, this one takes too few
+    samples -- which is why it survived that fix, and why it never appeared in a
+    close-up: above 1:1 there is no minification.
+
+    Measured at the default fit, hard one-pixel ridges over the whole figure:
+    8261 without mipmaps, 6040 with. The remainder is the artwork's own linework.
+    """
+    from ocs import atlas as atlas_mod
+    from ocs.config import AtlasSettings
+
+    built, _ = build(figure)
+    text = atlas_mod.pack(built.part_images, AtlasSettings()).to_text("skeleton.png")
+
+    filter_line = next(l for l in text.splitlines() if l.startswith("filter:"))
+    minify = filter_line.split(":", 1)[1].split(",")[0].strip()
+    assert minify.startswith("MipMap"), (
+        f"minification filter is {minify!r}; a minified page without mipmaps "
+        "aliases every thin edge into a crawling outline")
+
+    # Mipmaps average neighbouring texels together, so a packed page needs enough
+    # padding that a region cannot bleed into the one next to it at the levels
+    # actually used. 0.765 reaches level 1, which halves the gutter.
+    assert AtlasSettings().padding >= 4, "too little gutter to mipmap safely"
