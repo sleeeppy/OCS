@@ -320,8 +320,208 @@ def _turn_head(available: set[str]) -> dict:
     return {"bones": bones}
 
 
+
+# ── idle variants ────────────────────────────────────────────────────
+#
+# Five takes on the same problem: make a figure look alive while doing nothing.
+# What separates a believable idle from a rigged one is not amplitude, it is
+# structure, and all five are built from the same four rules.
+#
+# **Lag down the chain.** A breath starts at the trunk and reaches the neck,
+# then the head, then the ends of the hair, each a little later. Everything
+# arriving on the same keyframe is the single clearest tell that a machine wrote
+# the animation.
+#
+# **No exact mirror.** One side always moves a little less than the other.
+#
+# **Asymmetric timing.** Drawing breath is quicker than settling out of it. A
+# plain sine is symmetric in time and reads as a metronome; ``skew`` leans it.
+#
+# **Nothing that is resting may slide.** A hand on a skirt or under a chin has
+# its contact painted into the layer beneath -- the shadow it casts, the fabric
+# creased under it -- and that layer travels with a different bone. Move the hand
+# a few pixels and it leaves its own shadow behind. ``_planted_tips`` finds those
+# limbs by measurement and ``limb_swing_caps`` holds them to a pixel of travel,
+# so none of these five animate the arms directly.
+
+
+def _osc(
+    amplitude: float, loop: float, *, lag: float = 0.0, cycles: int = 1,
+    skew: float = 0.0, samples: int = 8, bias: float = 0.0,
+) -> tuple[tuple[float, float], ...]:
+    """(time, value) samples of a phase-shifted, time-skewed sine over one loop.
+
+    ``cycles`` is a whole number so the first and last sample agree and the loop
+    has no step in it. ``lag`` shifts the phase as a fraction of the loop, which
+    is how the chain delay is expressed. ``skew`` bends the phase so one half of
+    the cycle takes longer than the other.
+    """
+    frames: list[tuple[float, float]] = []
+    for i in range(samples + 1):
+        u = i / samples
+        phase = (u * cycles + lag) % 1.0
+        if skew:
+            phase = phase + skew * math.sin(2.0 * math.pi * phase) / (2.0 * math.pi)
+        frames.append((round(u * loop, 4),
+                       amplitude * math.sin(2.0 * math.pi * phase) + bias))
+    frames[-1] = (frames[-1][0], frames[0][1])
+    return tuple(frames)
+
+
+def _idle_breath(available: set[str]) -> dict:
+    """Quiet breathing, 4.2 s. The one to use when nothing else is happening.
+
+    Slow on purpose -- a person at rest breathes about fourteen times a minute,
+    and most generated idles run at twice that. The lag is the whole design: the
+    chest leads, the neck is a twentieth of a cycle behind it, the head twice
+    that, the hair nearly a fifth of a cycle late and swinging wider than what
+    drives it, because nothing is pulling it back.
+    """
+    loop = 4.2
+    bones: dict[str, dict] = {}
+    if "torso" in available:
+        rise = _osc(1.6, loop, skew=0.38)
+        bones["torso"] = {"translate": _trans(*[(t, 0.0, v + 1.6) for t, v in rise])}
+    if "neck" in available:
+        bones["neck"] = {"rotate": _rot(*_osc(0.9, loop, lag=0.05, skew=0.32))}
+    if "head" in available:
+        bones["head"] = {"rotate": _rot(*_osc(0.7, loop, lag=0.10, skew=0.32))}
+    if "hairBack" in available:
+        bones["hairBack"] = {"rotate": _rot(*_osc(1.9, loop, lag=0.19))}
+    return {"bones": bones}
+
+
+def _idle_settle(available: set[str]) -> dict:
+    """Weight settling into the pose, 7.5 s. The stillest of the five.
+
+    Two rates at once: the breath, and under it a much slower drift as the body
+    finds its balance. Because 7.5 s carries two breath cycles and one drift
+    cycle, the pose never repeats within the loop -- the figure returns to a
+    slightly different place each breath, which is what a person holding still
+    actually does. Nothing here is fast enough to read as a gesture.
+    """
+    loop = 7.5
+    bones: dict[str, dict] = {}
+    if "torso" in available:
+        breath = _osc(1.3, loop, cycles=2, skew=0.4, samples=12)
+        drift = _osc(0.9, loop, lag=0.28, samples=12)
+        bones["torso"] = {"translate": _trans(
+            *[(t, drift[i][1] * 0.8, v + 1.3) for i, (t, v) in enumerate(breath)])}
+    if "neck" in available:
+        bones["neck"] = {"rotate": _rot(*_osc(0.6, loop, lag=0.06, cycles=2,
+                                              skew=0.35, samples=12))}
+    if "head" in available:
+        fast = _osc(0.45, loop, lag=0.12, cycles=2, skew=0.35, samples=12)
+        slow = _osc(0.8, loop, lag=0.33, samples=12)
+        bones["head"] = {"rotate": _rot(
+            *[(t, v + slow[i][1]) for i, (t, v) in enumerate(fast)])}
+    if "hairBack" in available:
+        bones["hairBack"] = {"rotate": _rot(*_osc(1.4, loop, lag=0.22, samples=12))}
+    return {"bones": bones}
+
+
+def _idle_glance(available: set[str]) -> dict:
+    """Breathing with the attention wandering, 6.0 s.
+
+    The eyes carry it. They move first and by far the most -- gaze leads a head
+    turn by about a tenth of a second in life, and the head follows only part of
+    the way, because you do not turn your head to look at something you are not
+    interested in. Between the two glances the eyes hold still, which is what
+    makes the moves read as looking rather than drifting.
+    """
+    loop = 6.0
+    bones: dict[str, dict] = {}
+    if "torso" in available:
+        rise = _osc(1.4, loop, cycles=2, skew=0.36, samples=12)
+        bones["torso"] = {"translate": _trans(*[(t, 0.0, v + 1.4) for t, v in rise])}
+    if "eyes" in available:
+        bones["eyes"] = {"translate": _trans(
+            (0, 0, 0), (0.9, 0, 0), (1.35, 2.9, 0), (2.5, 2.6, 0), (2.9, 0, 0),
+            (3.6, 0, 0), (4.0, -2.4, 0), (4.9, -2.1, 0), (5.4, 0, 0), (6.0, 0, 0),
+        )}
+    if "head" in available:
+        bones["head"] = {"rotate": _rot(
+            (0, 0), (1.0, 0.3), (1.5, 2.1), (2.5, 1.9), (3.1, 0.2),
+            (3.7, -0.2), (4.15, -1.6), (4.9, -1.4), (5.5, 0.1), (6.0, 0),
+        )}
+    if "neck" in available:
+        bones["neck"] = {"rotate": _rot(
+            (0, 0), (1.1, 0.2), (1.65, 0.9), (2.6, 0.8), (3.2, 0.1),
+            (3.85, -0.1), (4.3, -0.7), (5.0, -0.6), (5.6, 0), (6.0, 0),
+        )}
+    if "hairBack" in available:
+        bones["hairBack"] = {"rotate": _rot(
+            (0, 0), (1.8, -1.5), (2.8, 0.6), (4.4, 1.3), (5.3, -0.5), (6.0, 0),
+        )}
+    return {"bones": bones}
+
+
+def _idle_sway(available: set[str]) -> dict:
+    """A slow lateral sway with the hair as a pendulum, 5.4 s.
+
+    The braid is the point. It hangs off the head, so it is driven by the head
+    and nothing drives it back -- it arrives late, swings past, and comes around
+    on its own period rather than the body's. Giving it a quarter-cycle lag and
+    twice the amplitude of what moves it is what makes hair look like hair
+    instead of a painted-on shape.
+    """
+    loop = 5.4
+    bones: dict[str, dict] = {}
+    if "torso" in available:
+        side = _osc(1.5, loop, skew=0.2, samples=12)
+        rise = _osc(1.1, loop, cycles=2, lag=0.1, skew=0.36, samples=12)
+        bones["torso"] = {"translate": _trans(
+            *[(t, v, rise[i][1] + 1.1) for i, (t, v) in enumerate(side)])}
+    if "neck" in available:
+        bones["neck"] = {"rotate": _rot(*_osc(-1.0, loop, lag=0.07, samples=12))}
+    if "head" in available:
+        bones["head"] = {"rotate": _rot(*_osc(-0.8, loop, lag=0.13, samples=12))}
+    if "hairBack" in available:
+        bones["hairBack"] = {"rotate": _rot(*_osc(3.2, loop, lag=0.26, samples=12))}
+    return {"bones": bones}
+
+
+def _idle_sigh(available: set[str]) -> dict:
+    """One long breath drawn and let go, 5.6 s.
+
+    Not a loop of a single shape: the chest fills over about a second and a half
+    and empties over three, and the head lifts a little on the way in and drops
+    slightly below where it started on the way out before recovering. That
+    difference between the two halves is the entire read -- a symmetric rise and
+    fall is a machine, an asymmetric one is a person.
+    """
+    loop = 5.6
+    bones: dict[str, dict] = {}
+    if "torso" in available:
+        bones["torso"] = {"translate": _trans(
+            (0, 0, 0), (0.5, 0, 1.4), (1.5, 0, 3.4), (2.0, 0, 3.1),
+            (3.4, 0, 0.9), (4.4, 0, -0.5), (5.1, 0, -0.2), (5.6, 0, 0),
+        )}
+    if "neck" in available:
+        bones["neck"] = {"rotate": _rot(
+            (0, 0), (0.7, 0.9), (1.7, 1.8), (2.3, 1.5),
+            (3.7, 0.3), (4.6, -0.6), (5.2, -0.2), (5.6, 0),
+        )}
+    if "head" in available:
+        bones["head"] = {"rotate": _rot(
+            (0, 0), (0.9, 0.7), (1.9, 1.5), (2.5, 1.2),
+            (3.9, 0.1), (4.8, -0.9), (5.3, -0.3), (5.6, 0),
+        )}
+    if "hairBack" in available:
+        bones["hairBack"] = {"rotate": _rot(
+            (0, 0), (1.2, -1.2), (2.4, 1.0), (3.2, 1.6),
+            (4.3, -0.8), (5.1, 0.4), (5.6, 0),
+        )}
+    return {"bones": bones}
+
+
 PRESETS = {
     "idle": _idle,
+    "idle_breath": _idle_breath,
+    "idle_settle": _idle_settle,
+    "idle_glance": _idle_glance,
+    "idle_sway": _idle_sway,
+    "idle_sigh": _idle_sigh,
     "walk": _walk,
     "wave": _wave,
     "jump": _jump,

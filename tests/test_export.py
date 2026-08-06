@@ -1001,3 +1001,59 @@ def test_a_part_behind_is_not_printed_with_the_shape_in_front_of_it(figure):
     assert worst < 40, (
         f"{where} shifted {worst:.0f} levels under the soft edge of what is in "
         "front of it, so it is carrying a print of that part's shape")
+
+
+def test_every_idle_variant_loops_without_a_step(figure):
+    """An idle that does not close jumps once per cycle, which is the worst tell.
+
+    Each variant is built from whole numbers of cycles so the first and last
+    sample of every channel agree. This checks the built document rather than the
+    generator, because the rotation clamp rescales timelines after the fact.
+    """
+    from ocs import spine_export
+
+    built, _ = build(figure)
+    names = [n for n in spine_export.PRESETS if n.startswith("idle")]
+    assert len(names) >= 5, "expected the idle variants to be registered"
+
+    doc = spine_export.build_skeleton(built, name="fixture")
+    spine_export.add_animations(doc, built, names)
+    assert spine_export.validate(doc) == []
+
+    for name in names:
+        for bone, timelines in doc["animations"][name]["bones"].items():
+            for channel, keys in timelines.items():
+                if len(keys) < 2:
+                    continue
+                for field in ("value", "x", "y"):
+                    first, last = keys[0].get(field, 0.0), keys[-1].get(field, 0.0)
+                    assert abs(first - last) < 1e-3, (
+                        f"{name}/{bone}/{channel}.{field} ends at {last} but starts "
+                        f"at {first}, so the loop steps")
+
+
+def test_the_idle_variants_leave_a_resting_hand_alone(figure):
+    """Whatever else they do, none of them may slide a hand across what it rests on.
+
+    The contact is painted into the layer underneath -- the shadow the hand casts,
+    the fabric creased under it -- and that layer travels with a different bone.
+    A 2.2 deg swing on a 498 px arm carries the hand 19 px across a skirt whose
+    painted shadow carries none, and what you see is the hand and a second copy of
+    its own outline trailing behind it.
+    """
+    import math
+
+    from ocs import spine_export
+
+    built, _ = build(figure)
+    planted = spine_export._planted_tips(built)
+    if not planted:
+        import pytest
+        pytest.skip("fixture has no limb resting on another part")
+
+    caps = spine_export.limb_swing_caps(built)
+    pos = {b.name: (b.world_x, b.world_y) for b in built.bones}
+    for bone, tip in planted:
+        travel = math.dist(pos[bone], pos[tip]) * math.radians(caps[bone][0])
+        assert travel <= spine_export._PLANTED_TRAVEL_PX + 1e-6, (
+            f"{bone} rests on something but its tip still travels {travel:.1f} px")
