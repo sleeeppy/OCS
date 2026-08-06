@@ -1057,3 +1057,88 @@ def test_the_idle_variants_leave_a_resting_hand_alone(figure):
         travel = math.dist(pos[bone], pos[tip]) * math.radians(caps[bone][0])
         assert travel <= spine_export._PLANTED_TRAVEL_PX + 1e-6, (
             f"{bone} rests on something but its tip still travels {travel:.1f} px")
+
+
+def test_cloth_deform_uses_the_4x_layout_and_the_right_array_length(figure):
+    """Two silent mistakes live here, and both produce no visible motion.
+
+    Spine 4.x nests deform under ``attachments`` -> skin -> slot -> attachment ->
+    ``deform``. The 3.8 layout, a top-level ``deform``, loads without complaint
+    and yields an animation with no deform timelines at all -- the only way to
+    notice is to count the timelines on the loaded skeleton.
+
+    And a *weighted* mesh stores ``[x, y, weight]`` per bone influence, not per
+    vertex, so the runtime walks one offset pair per influence. A vertex with
+    three bones needs its offset three times. Getting that wrong shifts every
+    vertex after the first weighted one.
+    """
+    from ocs import spine_export
+
+    built, _ = build(figure)
+    doc = spine_export.build_skeleton(built, name="fixture")
+    spine_export.add_animations(doc, built, ["idle_sway"])
+    assert spine_export.validate(doc) == []
+
+    anim = doc["animations"]["idle_sway"]
+    assert "deform" not in anim, "top-level 'deform' is the 3.8 layout; 4.x ignores it"
+    skins = anim.get("attachments")
+    assert skins and "default" in skins, "no deform timelines were emitted"
+
+    for slot_name, entries in skins["default"].items():
+        for attachment_name, timelines in entries.items():
+            assert "deform" in timelines
+            att = built.attachments[attachment_name]
+            influences, i = 0, 0
+            while i < len(att.vertices):
+                n = int(att.vertices[i])
+                influences += n
+                i += 1 + n * 4
+            for frame in timelines["deform"]:
+                assert len(frame["vertices"]) == influences * 2, (
+                    f"{slot_name}: {len(frame['vertices'])} offsets for "
+                    f"{influences} influences")
+
+
+def test_cloth_does_not_ripple_through_a_resting_hand(figure):
+    """Fabric under a hand is held, and the artwork already says so.
+
+    The shadow the hand casts is painted into the layer beneath and does not
+    ripple with it, so a wave running through the contact pulls the hand and its
+    own shadow apart. Measured before the damping: up to 2367 px of movement in
+    the region around the resting hand.
+    """
+    import numpy as np
+
+    from ocs import spine_export
+
+    built, _ = build(figure)
+    planted = spine_export._planted_tips(built)
+    if not planted:
+        import pytest
+        pytest.skip("fixture has no limb resting on another part")
+
+    field = spine_export._cloth_field(built)
+    pos = {b.name: (b.world_x, b.world_y) for b in built.bones}
+    held = [pos[tip] for _b, tip in planted if tip in pos]
+
+    checked = 0
+    for slot in built.slots:
+        att = built.attachments.get(slot.attachment)
+        part = built.part_images.get(slot.name)
+        if att is None or part is None or att.kind != "mesh" or not att.vertices:
+            continue
+        if taxonomy.base_tag(part.name) not in spine_export.CLOTH_TAGS:
+            continue
+        freedom = spine_export._cloth_profile(
+            att, part, field, built.origin_px, held)
+        uv = np.asarray(att.uvs).reshape(-1, 2) * [att.width, att.height]
+        world = np.array([rig_mod.px_to_spine((float(x), float(y)), built.origin_px)
+                          for x, y in uv + np.array(part.offset)])
+        for hx, hy in held:
+            near = np.linalg.norm(world - np.array([hx, hy]), axis=1) < 60.0
+            if not near.any():
+                continue
+            checked += 1
+            assert freedom[near].max() < 1e-3, (
+                f"{part.name} still ripples within 60 px of a resting contact")
+    assert checked, "no cloth mesh reaches a resting contact in the fixture"

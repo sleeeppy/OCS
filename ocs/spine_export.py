@@ -27,8 +27,12 @@ import json
 import math
 from pathlib import Path
 
+import numpy as np
+
+from . import taxonomy
 from .config import SPINE_VERSION
-from .rig import RigResult
+from .rig import Attachment, RigResult, px_to_spine
+from .psd_io import Part
 
 #: How far along the segment the bezier handles sit. 0.25/0.75 is the smooth
 #: ease-in-out the Spine editor emits.
@@ -515,6 +519,18 @@ def _idle_sigh(available: set[str]) -> dict:
     return {"bones": bones}
 
 
+#: Cloth settings per animation: (loop seconds, amplitude px, cycles, phase lag).
+#: The loop must match the preset's own, or the fabric and the body drift apart.
+CLOTH_MOTION = {
+    "idle":        (3.6, 4.5, 1, 0.20),
+    "idle_breath": (4.2, 5.0, 1, 0.22),
+    "idle_settle": (7.5, 4.0, 2, 0.25),
+    "idle_glance": (6.0, 4.5, 2, 0.18),
+    "idle_sway":   (5.4, 9.0, 1, 0.28),
+    "idle_sigh":   (5.6, 7.0, 1, 0.24),
+}
+
+
 PRESETS = {
     "idle": _idle,
     "idle_breath": _idle_breath,
@@ -712,6 +728,152 @@ def _clamp_rotations(data: dict, caps: dict[str, float]) -> dict:
     return data
 
 
+
+# ── cloth ────────────────────────────────────────────────────────────
+
+#: Tags whose meshes get a cloth ripple. Skin and rigid features do not drape.
+CLOTH_TAGS = frozenset({
+    "topwear", "bottomwear", "legwear", "handwear", "back hair", "front hair",
+    "tail", "wings",
+})
+
+
+def _cloth_field(rig: RigResult) -> tuple[float, float]:
+    """(hang_y, span) -- where cloth is pinned, and how far it falls.
+
+    Deliberately a property of the *skeleton*, not of each part. Two panels of one
+    garment are separate meshes with separate bones; if each scaled its ripple by
+    distance from its own bone they would disagree at the boundary they share and
+    the seam would open the moment the cloth moved. Reading the profile off world
+    position instead means any two meshes agree wherever they touch.
+    """
+    tops = [b.world_y for b in rig.bones if b.name in ("torso", "neck", "head")]
+    hang = max(tops) if tops else max((b.world_y for b in rig.bones), default=0.0)
+    low = min((b.world_y for b in rig.bones), default=hang - 1.0)
+    return hang, max(1.0, hang - low)
+
+
+#: Where the damping around a resting hand or foot is total, and where it ends.
+#:
+#: Dead flat out to the first radius, easing back to full motion by the second.
+#: A single smooth falloff from the contact point is not enough: the interior
+#: mesh vertices are ~28 px apart, so a narrow well simply falls between them and
+#: the fabric ripples through the hand anyway. Measured in a 90 px box centred on
+#: the resting hand, share of it moving: 34% at a 110 px smooth falloff.
+_CONTACT_DEAD_PX = 95.0
+_CONTACT_HOLD_PX = 230.0
+
+
+def _cloth_profile(
+    att: Attachment, part: Part, field: tuple[float, float],
+    origin: tuple[float, float], held: list[tuple[float, float]],
+) -> np.ndarray:
+    """Per-vertex freedom, 0 where the cloth is held and 1 where it hangs free.
+
+    Cloth is pinned at the top and loosest at the bottom, so the amplitude has to
+    grow as it falls -- a skirt that moves at the waist as much as at the hem
+    looks like a flag, not a skirt.
+
+    And it is pinned again wherever something rests on it. Without that the ripple
+    runs straight through the hand lying on the skirt, which is worse than not
+    moving at all: the shadow the hand casts is painted into the layer underneath
+    and does not ripple with it, so the hand and its own shadow come apart. The
+    first pass moved the region around the resting hand by up to 2367 px.
+    """
+    hang, span = field
+    uv = np.asarray(att.uvs, dtype=np.float64).reshape(-1, 2)
+    ox, oy = part.offset
+    px = uv * np.array([att.width, att.height]) + np.array([ox, oy])
+    world = np.array([px_to_spine((float(x), float(y)), origin) for x, y in px])
+    freedom = np.clip((hang - world[:, 1]) / span, 0.0, 1.0)
+
+    for hx, hy in held:
+        d = np.linalg.norm(world - np.array([hx, hy])[None, :], axis=1)
+        t = np.clip((d - _CONTACT_DEAD_PX)
+                    / max(1.0, _CONTACT_HOLD_PX - _CONTACT_DEAD_PX), 0.0, 1.0)
+        # Smoothstep, so the fabric eases back into motion instead of creasing
+        # along a line where the damping stops.
+        freedom *= t * t * (3.0 - 2.0 * t)
+    return freedom
+
+
+def cloth_deform(
+    rig: RigResult, loop: float, amplitude: float, *,
+    cycles: int = 1, samples: int = 8, lag: float = 0.0, travel: float = 0.55,
+) -> dict:
+    """Deform timelines that let the garments move without moving a bone.
+
+    This is the answer to "the arms and the clothes do not move". They could not
+    move by rotation: both of this character's hands are resting on something, and
+    a hand that slides even a few pixels leaves the shadow painted under it
+    behind. But a mesh does not need its bone to turn -- Spine can push the
+    vertices directly, which is what a deform timeline is, and a sleeve can swing
+    while the hand inside it stays exactly where it is.
+
+    Three things make the result look like cloth rather than a wobbling sheet:
+
+    - **Pinned at the top.** The offset scales with distance from the point the
+      panel hangs from, squared, so the shoulder is still and the hem moves most.
+    - **The ripple travels.** Phase is delayed by that same distance, so a wave
+      runs down the fabric instead of the whole panel pulsing together.
+    - **Mostly sideways.** Cloth swings across gravity, so the vertical component
+      is a third of the horizontal.
+
+    The format is per *bone influence*, not per vertex: a weighted mesh stores
+    ``[x, y, weight]`` per influence and the runtime adds one offset pair to each
+    as it accumulates, so a vertex with three bones needs its offset three times.
+    Getting that wrong silently shifts every vertex after the first weighted one.
+    """
+    out: dict[str, dict] = {}
+    field = _cloth_field(rig)
+    origin = rig.origin_px
+    pos = {b.name: (b.world_x, b.world_y) for b in rig.bones}
+    held = [pos[tip] for _bone, tip in _planted_tips(rig) if tip in pos]
+
+    for slot in rig.slots:
+        att = rig.attachments.get(slot.attachment)
+        part = rig.part_images.get(slot.name)
+        if att is None or part is None or att.kind != "mesh" or not att.vertices:
+            continue
+        if taxonomy.base_tag(part.name) not in CLOTH_TAGS:
+            continue
+        freedom = _cloth_profile(att, part, field, origin, held)
+        if not freedom.any():
+            continue
+
+        # How many influences each vertex has, so the offsets can be repeated.
+        counts: list[int] = []
+        i = 0
+        while i < len(att.vertices):
+            n = int(att.vertices[i])
+            counts.append(n)
+            i += 1 + n * 4
+        if len(counts) != freedom.shape[0]:
+            continue
+
+        frames: list[dict] = []
+        for k in range(samples + 1):
+            u = k / samples
+            t = u * loop
+            values: list[float] = []
+            for vi, n in enumerate(counts):
+                theta = 2.0 * math.pi * (
+                    u * cycles + lag - travel * float(freedom[vi]))
+                swing = amplitude * (float(freedom[vi]) ** 2) * math.sin(theta)
+                dx, dy = round(swing, 3), round(swing * 0.34, 3)
+                values.extend([dx, dy] * n)
+            frame: dict = {"offset": 0, "vertices": values}
+            if t:
+                frame["time"] = round(t, 4)
+            frames.append(frame)
+        # Close the loop exactly.
+        frames[-1]["vertices"] = list(frames[0]["vertices"])
+        if any(any(v) for v in (f["vertices"] for f in frames)):
+            out.setdefault(slot.name, {})[slot.attachment] = {"deform": frames}
+
+    return {"default": out} if out else {}
+
+
 def add_animations(doc: dict, rig: RigResult, names: list[str] | None = None) -> dict:
     available = {b.name for b in rig.bones}
     caps = limb_swing_caps(rig)
@@ -720,7 +882,16 @@ def add_animations(doc: dict, rig: RigResult, names: list[str] | None = None) ->
         if gen is None:
             continue
         data = _clamp_rotations(gen(available), caps)
-        if data.get("bones"):
+        if name in CLOTH_MOTION:
+            loop, amp, cycles, lag = CLOTH_MOTION[name]
+            deform = cloth_deform(rig, loop, amp, cycles=cycles, lag=lag)
+            if deform:
+                # Spine 4.x nests these under "attachments", by skin then slot then
+                # attachment, with "deform" as the timeline key inside. The 3.8
+                # layout -- a top-level "deform" -- is accepted silently and
+                # produces an animation with no deform timelines at all.
+                data["attachments"] = deform
+        if data.get("bones") or data.get("attachments"):
             doc["animations"][name] = data
     return doc
 
