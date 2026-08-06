@@ -686,10 +686,18 @@ def test_parts_that_meet_agree_on_where_they_are_going(figure):
         return px, rig_mod._unpack_vertices(att, built.bones)
 
     geo = {n: geometry(n) for n in names}
+    layer = {sl.name: taxonomy.base_tag(sl.part_name) for sl in built.slots}
     radius = RigSettings().weld_radius_px
     checked, worst, where = 0, 0.0, ""
     for i, a in enumerate(names):
         for b in names[i + 1:]:
+            # Same layer only. Two pieces cut from one garment must move as one or
+            # the cut opens. Two different layers that merely touch must *not* be
+            # forced together: a hand resting on a skirt is exactly that, and
+            # pooling them put a leg bone on a finger vertex at 48% while its
+            # neighbours were 98% elbow, which sheared the finger off the hand.
+            if layer[a] != layer[b]:
+                continue
             pa, wa = geo[a]
             pb, wb = geo[b]
             d = np.linalg.norm(pa[:, None, :] - pb[None, :, :], axis=2)
@@ -1156,9 +1164,14 @@ def test_a_moving_arm_does_not_tear_the_seams_it_crosses(figure):
         geo[slot.name] = (px, rig_mod._unpack_vertices(att, built.bones))
 
     names = list(geo)
+    layer = {sl.name: taxonomy.base_tag(sl.part_name) for sl in built.slots}
     worst, where, checked = 0.0, "", 0
     for i, a in enumerate(names):
         for b in names[i + 1:]:
+            # Only a cut *within* one layer has to hold together; see the note in
+            # test_parts_that_meet_agree_on_where_they_are_going.
+            if layer[a] != layer[b]:
+                continue
             pa, wa = geo[a]
             pb, wb = geo[b]
             d = np.linalg.norm(pa[:, None, :] - pb[None, :, :], axis=2)
@@ -1209,3 +1222,34 @@ def test_sampled_idle_timelines_are_linear(figure):
                     f"{name}/{bone}/{channel}: {eased} of {len(keys)} sampled keys "
                     "carry a curve, so the motion stops at each one")
     assert checked, "no sampled timelines found to check"
+
+
+def test_a_hand_resting_on_a_garment_is_not_welded_to_it(figure):
+    """Welding is for cuts inside one layer, not for things that merely touch.
+
+    A hand lying on a skirt puts their vertices in the same place, and pooling
+    the weights there gave one finger vertex 50% leftElbow / 48% leftLeg while
+    every vertex a few pixels away stayed at 98% leftElbow. The finger then
+    travelled with the leg while the rest of the hand followed the elbow, and it
+    sheared -- which is what "the fingers are squashed" was.
+
+    Nothing that drives a limb may come from another limb's chain.
+    """
+    built, _ = build(figure)
+    names = [b.name for b in built.bones]
+    leg_bones = {"leftLeg", "rightLeg", "leftKnee", "rightKnee",
+                 "leftFoot", "rightFoot"}
+    arm_bones = {"leftArm", "rightArm", "leftElbow", "rightElbow",
+                 "leftHand", "rightHand"}
+
+    for slot in built.slots:
+        att = built.attachments[slot.attachment]
+        if att.kind != "mesh" or not att.vertices:
+            continue
+        used = {names[i] for i in att.bones_used}
+        tag = taxonomy.base_tag(slot.part_name)
+        region = taxonomy.part_region(slot.part_name) or ""
+        if tag == "handwear" and region.startswith("arm"):
+            assert not (used & leg_bones), f"{slot.name} is driven by {used & leg_bones}"
+        if tag == "bottomwear" and region.startswith("leg"):
+            assert not (used & arm_bones), f"{slot.name} is driven by {used & arm_bones}"

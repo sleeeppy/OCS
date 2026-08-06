@@ -1243,6 +1243,10 @@ def weld_shared_vertices(
         maps[name] = _unpack_vertices(att, bones)
         owner.extend([name] * world.shape[0])
 
+    # Keyed by slug, so the tag has to come from the part, not the slug -- the
+    # slug has already had its separators flattened and base_tag cannot read it.
+    layer_of = {n: taxonomy.base_tag(part_images[n].name) for n in names}
+
     allpts = np.concatenate(points, axis=0)
     index: list[tuple[str, int]] = []
     for name, world in zip(names, points):
@@ -1266,8 +1270,17 @@ def weld_shared_vertices(
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
                 near.extend(buckets.get((int(kx) + dx, int(ky) + dy), ()))
+        # Only across slices of the *same layer*. Two pieces cut from one garment
+        # have to move as one or the cut opens; two different layers that merely
+        # touch must not, and a hand resting on a skirt is exactly that. Welding
+        # them pooled a finger vertex to 50% leftElbow / 48% leftLeg while every
+        # vertex a few pixels away stayed at 98% leftElbow, so the finger sheared
+        # away from the rest of the hand as soon as anything moved. That is the
+        # squashing.
+        tag_i = layer_of[index[i][0]]
         group = [j for j in near
-                 if float(np.linalg.norm(allpts[j] - allpts[i])) <= radius]
+                 if float(np.linalg.norm(allpts[j] - allpts[i])) <= radius
+                 and layer_of[index[j][0]] == tag_i]
         if len({owner[j] for j in group}) < 2:
             continue
         pooled: dict[str, float] = {}
