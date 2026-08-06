@@ -948,3 +948,56 @@ def test_the_atlas_asks_for_mipmaps(figure):
     # padding that a region cannot bleed into the one next to it at the levels
     # actually used. 0.765 reaches level 1, which halves the gutter.
     assert AtlasSettings().padding >= 4, "too little gutter to mipmap safely"
+
+
+def test_a_part_behind_is_not_printed_with_the_shape_in_front_of_it(figure):
+    """Otherwise a hand leaves its own silhouette on the skirt it rests on.
+
+    ``restore_source_pixels`` copies the artwork into whichever part is visible,
+    and a nearer part only stops that where it *claims* the pixel. The claim floor
+    is high on purpose -- a feathered edge at alpha 9 hides nothing, and letting it
+    claim leaves the visible part behind holding see-through's drifted colour, a
+    dark line along every outline.
+
+    The cost of setting it at 255 is the mirror image. Where a nearer part is
+    almost opaque and still does not claim, the artwork's value is mostly that
+    part, and the layer behind gets painted with it -- printing a pale outline of
+    the hand into the fabric. Nothing shows while the hand covers it; move the hand
+    and its silhouette stays behind. Hiding the hand in the running player shows
+    the print directly, in pale gold across the skirt.
+
+    Measured on this character: print strength 47.7 at a claim floor of 250, 27.2
+    at 220, for 3% on the whole-canvas error and nothing at the 48-level threshold.
+    """
+    import numpy as np
+
+    from ocs import rig as rig_mod
+    from ocs.config import RigSettings
+
+    reports = cleanup.analyze(figure)
+    kept, _ = cleanup.apply_verdicts(figure, reports)
+    rig = skeleton.guess_rig(figure, kept)
+    parts, _ = limbs.partition(figure, kept, rig, RigSettings())
+    ordered = rig_mod._resolve_draw_order(parts, figure)
+    before = {p.name: p.rgba.copy() for p in ordered}
+    after = rig_mod.restore_source_pixels(ordered, figure, RigSettings())
+
+    worst, where = 0.0, ""
+    for i, part in enumerate(after):
+        # Everything drawn in front of this part, at partial coverage.
+        soft = np.zeros(figure.canvas[::-1], bool)
+        for nearer in ordered[i + 1:]:
+            a = nearer.canvas_rgba(figure.canvas)[..., 3]
+            soft |= (a > 8) & (a < 250)
+        x1, y1, x2, y2 = part.bbox
+        window = soft[y1:y2, x1:x2] & (part.rgba[..., 3] >= 250)
+        if not window.any():
+            continue
+        drift = np.abs(part.rgba[..., :3][window].astype(int)
+                       - before[part.name][..., :3][window].astype(int)).max(axis=1)
+        if drift.mean() > worst:
+            worst, where = float(drift.mean()), part.name
+
+    assert worst < 40, (
+        f"{where} shifted {worst:.0f} levels under the soft edge of what is in "
+        "front of it, so it is carrying a print of that part's shape")

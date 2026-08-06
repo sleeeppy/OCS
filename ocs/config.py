@@ -198,11 +198,40 @@ class RigSettings:
     #: under 6% opaque and contribute nothing either way.
     source_pixel_alpha_floor_interior: int = 16
     #: How opaque a nearer part must be before it stops the part behind it being
-    #: repainted from the source. Near-255 on purpose: a feathered edge at alpha 9
-    #: hides nothing, so letting it claim the pixel leaves the *visible* part
-    #: behind it holding see-through's drifted colour -- a dark line along every
-    #: outline. See ``rig.restore_source_pixels``.
-    source_pixel_claim_floor: int = 250
+    #: repainted from the source.
+    #:
+    #: High on purpose: a feathered edge at alpha 9 hides nothing, so letting it
+    #: claim the pixel leaves the *visible* part behind it holding see-through's
+    #: drifted colour -- a dark line along every outline.
+    #:
+    #: But not 255 either, and this is the other half of the same trade. Where a
+    #: nearer part is *almost* opaque and does not claim, the artwork's value there
+    #: is mostly that part, and the layer behind gets painted with it. Around a
+    #: hand resting on a skirt that prints a pale outline of the hand into the
+    #: fabric: invisible while the hand covers it, and left behind on the skirt the
+    #: moment the hand moves -- the outline that trails the arm. Hiding the hand in
+    #: the player shows the print directly, drawn in pale gold across the skirt.
+    #:
+    #: Measured on this character, the print's strength against the whole-canvas
+    #: error it costs to reduce it:
+    #:
+    #:   claim   print   canvas >18   canvas >48
+    #:     250    47.7         3233          780
+    #:     220    27.2         3326          780
+    #:     200    22.0         3760          780
+    #:     128    11.8         6185         1107
+    #:
+    #: 220 halves the print for 3% on the one metric and nothing on the other.
+    #: Below that the cost climbs steeply, because the part behind starts keeping
+    #: see-through's drift over real area rather than a hairline.
+    #:
+    #: Removing it outright needs the artwork *un-composited* -- subtracting what
+    #: is in front to recover what is behind. That is exact on paper and was tried:
+    #: it works on a two-layer test and falls apart here, because this character is
+    #: gauze over gauze, several semi-transparent layers deep, and the division by
+    #: the remaining coverage amplifies rounding into noise. Whole-canvas error went
+    #: to 8412. See ``rig.restore_source_pixels``.
+    source_pixel_claim_floor: int = 220
     #: Restore the opacity the layer split lost, where the artwork was opaque.
     #:
     #: Splitting one antialiased image into layers halves the alpha at every
