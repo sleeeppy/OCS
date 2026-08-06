@@ -70,6 +70,8 @@ class AtlasResult:
             "format: RGBA8888",
             "filter: Linear, Linear",
             "repeat: none",
+            # The page is premultiplied. See ``_premultiply``.
+            "pma: true",
         ]
         for r in self.regions:
             lines += [
@@ -82,6 +84,36 @@ class AtlasResult:
                 "  index: -1",
             ]
         return "\n".join(lines) + "\n"
+
+
+def _premultiply(rgba: np.ndarray) -> np.ndarray:
+    """Multiply RGB by alpha, so the GPU may filter the page correctly.
+
+    Bilinear filtering of a *straight*-alpha texture interpolates colour and
+    alpha independently, and that is not a valid operation: halfway between an
+    opaque pixel and a transparent one it returns the average of the two colours
+    at half alpha, when the right answer is the opaque pixel's colour at half
+    alpha. The error appears at every edge where alpha varies, and because a
+    part's feathered edge is a continuous one-pixel curve, it appears as a line.
+
+    Over one face that was a grey scratch traced along the jaw, along every wisp
+    of hair across the cheek, around the hand and the shoulder. Forcing the
+    sampler to ``NEAREST`` made all of them vanish, which is what identified it:
+    nothing about the texture, the mesh or the compositing was wrong, only the
+    filtering of a format that cannot be filtered.
+
+    Premultiplying makes interpolation linear in the quantity actually being
+    blended, so the sampler is correct at every edge. ``pma: true`` in the page
+    header tells the runtime to pair it with the matching blend function
+    (``ONE, ONE_MINUS_SRC_ALPHA`` instead of ``SRC_ALPHA, ONE_MINUS_SRC_ALPHA``).
+
+    ``_bleed_rgb`` still runs first. It costs nothing here and keeps the page
+    readable in an image editor, where premultiplied transparent black would
+    otherwise hide what each region contains.
+    """
+    out = rgba.astype(np.uint16)
+    out[..., :3] = (out[..., :3] * out[..., 3:4] + 127) // 255
+    return out.astype(np.uint8)
 
 
 def _next_pow2(v: int) -> int:
@@ -203,6 +235,6 @@ def pack(
 
     regions.sort(key=lambda r: r.name)
     return AtlasResult(
-        image=Image.fromarray(canvas), regions=regions,
+        image=Image.fromarray(_premultiply(canvas)), regions=regions,
         size=(width, height), png_name="skeleton.png",
     )

@@ -769,3 +769,50 @@ def test_a_feathered_edge_inside_the_figure_is_repainted():
     got = composite(rig_mod.restore_source_pixels(ordered, decomp, RS()))
     worst = float(np.abs(got - want).max(axis=2)[band].max())
     assert worst < 3, f"the feathered band is still {worst:.0f} levels off"
+
+
+def test_the_atlas_is_premultiplied_and_the_player_agrees(figure, tmp_path):
+    """Straight alpha cannot be filtered, and the two ends must match.
+
+    Bilinear filtering of a straight-alpha texture interpolates colour and alpha
+    independently. That is not a valid operation: halfway between an opaque pixel
+    and a transparent one it returns the average of the two colours at half alpha,
+    where the right answer is the opaque colour at half alpha. The error lands on
+    every edge where alpha varies, and a part's feathered edge is a continuous
+    one-pixel curve, so it shows up as a line -- over one face, a grey scratch
+    along the jaw, along every wisp of hair on the cheek, around the hand and the
+    shoulder. Forcing the sampler to NEAREST made all of them vanish, which is
+    what identified it.
+
+    Premultiplying fixes the sampler, but only if the runtime blends to match. An
+    explicit ``premultipliedAlpha`` in the player config overrides the page
+    header, so the two can disagree silently -- and a premultiplied page blended
+    with the straight-alpha function puts a grey halo on every soft edge, which
+    is worse than what it set out to fix. Hence one test over both.
+    """
+    import numpy as np
+
+    from ocs import atlas as atlas_mod, player as player_mod
+    from ocs.config import AtlasSettings
+
+    built, _ = build(figure)
+    packed = atlas_mod.pack(built.part_images, AtlasSettings())
+
+    text = packed.to_text("skeleton.png")
+    assert "pma: true" in text, "the page header must declare premultiplied alpha"
+
+    rgba = np.asarray(packed.image.convert("RGBA")).astype(int)
+    over = rgba[..., :3] > (rgba[..., 3:4] + 1)
+    assert not over.any(), (
+        f"{int(over.sum())} texels have a channel above their own alpha, so the "
+        "page is not actually premultiplied")
+
+    doc = spine_export.build_skeleton(built, name="fixture")
+    spine_export.add_animations(doc, built)
+    (tmp_path / "skeleton.json").write_text(json.dumps(doc), encoding="utf-8")
+    packed.write(tmp_path)
+    out, _embedded = player_mod.build_preview(
+        tmp_path / "skeleton.json", tmp_path / "skeleton.atlas",
+        tmp_path / "skeleton.png", tmp_path / "preview.html")
+    assert "premultipliedAlpha: true" in out.read_text(encoding="utf-8"), (
+        "the player must blend premultiplied, or every soft edge gains a halo")

@@ -804,18 +804,24 @@ def close_layer_seams(
             acc = siblings[tag] = np.zeros((ch, cw), dtype=bool)
         acc |= part.canvas_rgba(decomp.canvas)[..., 3] >= s.source_alpha_solid_floor
 
-    # Feathering already claimed by something further back, accumulated as the
-    # draw order is walked. See the ``feathered_behind`` test below.
-    behind = np.zeros((ch, cw), dtype=bool)
+    # Whose blend is this? The nearest solid pixel decides. Ties go to whatever
+    # is further back, which is the order this walks in.
+    nearest = np.full((ch, cw), np.inf, dtype=np.float32)
+    owner = np.full((ch, cw), -1, dtype=np.int16)
+    for i, part in enumerate(ordered):
+        core_canvas = (part.canvas_rgba(decomp.canvas)[..., 3]
+                       >= s.source_alpha_solid_floor)
+        if not core_canvas.any():
+            continue
+        distance = ndi.distance_transform_edt(~core_canvas).astype(np.float32)
+        closer = distance < nearest
+        nearest[closer] = distance[closer]
+        owner[closer] = i
 
     out: list[Part] = []
-    for part in ordered:
+    for i, part in enumerate(ordered):
         alpha = part.rgba[..., 3]
         core = alpha >= s.source_alpha_solid_floor
-        canvas_alpha = part.canvas_rgba(decomp.canvas)[..., 3]
-        feathered_behind = behind.copy()
-        behind |= ((canvas_alpha > s.source_alpha_touch_floor)
-                   & (canvas_alpha < s.source_alpha_solid_floor))
         if not core.any():
             out.append(part)
             continue
@@ -845,25 +851,33 @@ def close_layer_seams(
         rim = alpha > s.source_alpha_touch_floor
         enclosed = ndi.binary_fill_holes(core) & ~core
 
-        # And not where something *behind* is feathering across the same pixel.
+        # Outside a sibling's territory, a pixel goes to whichever part's solid
+        # body is nearest -- ``owner`` above.
         #
-        # The extension is meant for the layer behind, as the arithmetic above
-        # says: raising the front one closes the alpha gap but replaces the blend
-        # with the front layer's colour alone. Two parts feathering into each other
-        # are not a cut, they are the artwork's own antialiasing between two
-        # different objects, and raising both makes the later-drawn one win
-        # outright -- which also hands it the pixels, and the bone they ride.
+        # Two parts feathering into each other are not a cut; they are the
+        # artwork's own antialiasing between two different objects. Raising both
+        # is what put the chin on the hand: ``handwear-r@arm_r`` and ``face`` both
+        # taper along the jaw, sealing raised both, the hand draws after the face,
+        # and 139 px of jaw travelled with ``rightArm``. Raising *neither* is worse
+        # -- the blend is then short of opaque, which nearest-sample compositing
+        # hides and the GPU's bilinear filtering does not, so 4500 px along the jaw
+        # let a quarter of the background through as a grey line.
         #
-        # That is the chin stuck to the hand. ``handwear-r@arm_r`` and ``face``
-        # both taper off along the jaw; sealing raised both, the hand is drawn
-        # after the face, and 139 px of jaw went with ``rightArm`` whenever the
-        # arm moved. Letting the face -- the part behind -- own the blend puts
-        # them back on ``head``.
-        #
-        # A cut is unaffected: the piece behind is either fully opaque there or
-        # not present at all, never mid-taper, so nothing is skipped.
+        # Nearest-core settles it without needing to know what anything is. The
+        # jaw side is nearer the face and goes to ``head``; the hand side is nearer
+        # the hand. Coverage stays complete because every pixel in the band has
+        # exactly one owner and that owner fills it. And it is what keeps the
+        # spaces between the fingers open: the skirt behind them is *solid* there,
+        # distance zero, so it owns them outright and the hand cannot reach in.
+        # The owner fills its whole half of the band, not only the part of it it
+        # already has alpha at. Requiring existing alpha leaves the middle of the
+        # band -- where both tapers have run out -- at nothing, and nearest-sample
+        # compositing cannot see that: the two tapers add to 1.0 at the texel
+        # centres. Bilinear sampling between those centres does not, and 3675 px
+        # along the jaw came out 43% short, which is the grey line.
+        mine = _window(owner == i)
         grown = (ndi.binary_dilation(core, struct, iterations=radius)
-                 & ~core & (rim | sibling) & ~enclosed & ~_window(feathered_behind))
+                 & ~core & (sibling | mine) & ~enclosed)
 
         target = grown & allowed
         if not target.any():
