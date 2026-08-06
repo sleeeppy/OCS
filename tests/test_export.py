@@ -276,6 +276,7 @@ def test_curve_arity_matches_the_timeline_channel_count(figure):
     spine_export.add_animations(doc, built)
 
     seen = set()
+    curved = 0
     for anim_name, anim in doc["animations"].items():
         for bone_name, timelines in anim["bones"].items():
             for timeline_name, keys in timelines.items():
@@ -283,16 +284,19 @@ def test_curve_arity_matches_the_timeline_channel_count(figure):
                 seen.add(timeline_name)
                 for i, key in enumerate(keys):
                     curve = key.get("curve")
+                    # A missing curve is Spine's default, linear, and that is what
+                    # a *sampled* timeline wants -- easing between every one of
+                    # sixteen samples stops the value dead at each and the motion
+                    # stutters. Only the arity of a curve that *is* there matters.
                     if curve is None:
-                        assert i == len(keys) - 1, (
-                            f"{anim_name}/{bone_name}/{timeline_name} key {i} has no curve"
-                        )
                         continue
+                    curved += 1
                     assert len(curve) == channels * 4, (
                         f"{anim_name}/{bone_name}/{timeline_name} key {i}: "
                         f"{len(curve)} values for {channels} channel(s)"
                     )
     assert {"rotate", "translate"} <= seen, "fixture exercises both arities"
+    assert curved, "no curves emitted at all, so the arity check proved nothing"
 
 
 def test_curve_handles_are_absolute_coordinates(figure):
@@ -1170,3 +1174,38 @@ def test_a_moving_arm_does_not_tear_the_seams_it_crosses(figure):
         f"{where} disagree by {worst:.3f} at a shared vertex; a limb crossing that "
         "seam will pull it open")
     assert index, "bones should be indexed"
+
+
+def test_sampled_idle_timelines_are_linear(figure):
+    """Easing between every sample is what makes a sampled curve stutter.
+
+    ``_handles`` brings the value to a stop at the start and end of each segment.
+    Between two or three hand-placed keys that is the point. Across sixteen
+    samples of a sine it is sixteen little stops a cycle, and the motion reads as
+    stepping rather than flowing. Spine's default with no curve is linear, and
+    straight lines between closely spaced samples are what a smooth curve looks
+    like.
+
+    Only the oscillator-driven bones are checked. ``idle_glance`` and
+    ``idle_sigh`` place some keys by hand -- a held gaze, the top of a breath --
+    and those are supposed to ease.
+    """
+    from ocs import spine_export
+
+    built, _ = build(figure)
+    doc = spine_export.build_skeleton(built, name="fixture")
+    names = ["idle_breath", "idle_settle", "idle_sway"]
+    spine_export.add_animations(doc, built, names)
+
+    checked = 0
+    for name in names:
+        for bone, timelines in doc["animations"][name]["bones"].items():
+            for channel, keys in timelines.items():
+                if len(keys) < 8:
+                    continue          # hand-placed, easing is intended
+                checked += 1
+                eased = sum(1 for k in keys if "curve" in k)
+                assert eased == 0, (
+                    f"{name}/{bone}/{channel}: {eased} of {len(keys)} sampled keys "
+                    "carry a curve, so the motion stops at each one")
+    assert checked, "no sampled timelines found to check"

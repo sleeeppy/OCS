@@ -146,21 +146,29 @@ def build_skeleton(rig: RigResult, name: str = "character", images: str = "./ima
 # --------------------------------------------------------------------------
 
 
-def _rot(*frames: tuple[float, float]) -> list[dict]:
-    """Rotation timeline from (time, degrees) pairs, eased between keys."""
+def _rot(*frames: tuple[float, float], linear: bool = False) -> list[dict]:
+    """Rotation timeline from (time, degrees) pairs.
+
+    ``linear`` omits the curve, which is Spine's default and what a *sampled*
+    curve needs. ``_handles`` eases in and out between every consecutive pair --
+    right for two or three hand-placed keys, and wrong for a sine cut into a
+    dozen samples, because it brings the value to a stop at each one. Twelve
+    little stops a cycle is exactly what "the animation stutters" looks like.
+    Straight lines between closely spaced samples read as one smooth curve.
+    """
     out: list[dict] = []
     for i, (t, v) in enumerate(frames):
         kf: dict = {"value": round(v, 3)}
         if t:
             kf["time"] = round(t, 4)
-        if i < len(frames) - 1:
+        if not linear and i < len(frames) - 1:
             t2, v2 = frames[i + 1]
             kf["curve"] = [round(c, 5) for c in _handles(t, v, t2, v2)]
         out.append(kf)
     return out
 
 
-def _trans(*frames: tuple[float, float, float]) -> list[dict]:
+def _trans(*frames: tuple[float, float, float], linear: bool = False) -> list[dict]:
     """Translation timeline from (time, x, y) triples.
 
     The ``curve`` here carries **8** numbers, not 4. A translate timeline has two
@@ -180,7 +188,7 @@ def _trans(*frames: tuple[float, float, float]) -> list[dict]:
             kf["x"] = round(x, 3)
         if abs(y) > 1e-6:
             kf["y"] = round(y, 3)
-        if i < len(frames) - 1:
+        if not linear and i < len(frames) - 1:
             t2, x2, y2 = frames[i + 1]
             kf["curve"] = [
                 round(c, 5)
@@ -351,7 +359,7 @@ def _turn_head(available: set[str]) -> dict:
 
 def _osc(
     amplitude: float, loop: float, *, lag: float = 0.0, cycles: int = 1,
-    skew: float = 0.0, samples: int = 8, bias: float = 0.0,
+    skew: float = 0.0, samples: int = 16, bias: float = 0.0,
 ) -> tuple[tuple[float, float], ...]:
     """(time, value) samples of a phase-shifted, time-skewed sine over one loop.
 
@@ -374,7 +382,7 @@ def _osc(
 
 def _breathe_arms(
     bones: dict[str, dict], available: set[str], loop: float, amplitude: float,
-    *, lag: float = 0.08, cycles: int = 1, samples: int = 8,
+    *, lag: float = 0.08, cycles: int = 1, samples: int = 16,
 ) -> None:
     """Give the arms a share of the breath, lagged and unmirrored.
 
@@ -392,11 +400,11 @@ def _breathe_arms(
     for side in ("left", "right"):
         arm, elbow = f"{side}Arm", f"{side}Elbow"
         if arm in available:
-            bones[arm] = {"rotate": _rot(*_osc(
+            bones[arm] = {"rotate": _rot(linear=True, *_osc(
                 _sym(side, amplitude) * bias[side], loop,
                 lag=lag, cycles=cycles, skew=0.25, samples=samples))}
         if elbow in available:
-            bones[elbow] = {"rotate": _rot(*_osc(
+            bones[elbow] = {"rotate": _rot(linear=True, *_osc(
                 _sym(side, amplitude * 0.66) * bias[side], loop,
                 lag=lag + 0.05, cycles=cycles, skew=0.25, samples=samples))}
 
@@ -414,13 +422,13 @@ def _idle_breath(available: set[str]) -> dict:
     bones: dict[str, dict] = {}
     if "torso" in available:
         rise = _osc(3.4, loop, skew=0.38)
-        bones["torso"] = {"translate": _trans(*[(t, 0.0, v + 3.4) for t, v in rise])}
+        bones["torso"] = {"translate": _trans(*[(t, 0.0, v + 3.4) for t, v in rise], linear=True)}
     if "neck" in available:
-        bones["neck"] = {"rotate": _rot(*_osc(1.9, loop, lag=0.05, skew=0.32))}
+        bones["neck"] = {"rotate": _rot(linear=True, *_osc(1.9, loop, lag=0.05, skew=0.32))}
     if "head" in available:
-        bones["head"] = {"rotate": _rot(*_osc(1.5, loop, lag=0.10, skew=0.32))}
+        bones["head"] = {"rotate": _rot(linear=True, *_osc(1.5, loop, lag=0.10, skew=0.32))}
     if "hairBack" in available:
-        bones["hairBack"] = {"rotate": _rot(*_osc(4.2, loop, lag=0.19))}
+        bones["hairBack"] = {"rotate": _rot(linear=True, *_osc(4.2, loop, lag=0.19))}
     _breathe_arms(bones, available, loop, 3.4, lag=0.08)
     return {"bones": bones}
 
@@ -437,21 +445,22 @@ def _idle_settle(available: set[str]) -> dict:
     loop = 7.5
     bones: dict[str, dict] = {}
     if "torso" in available:
-        breath = _osc(2.8, loop, cycles=2, skew=0.4, samples=12)
-        drift = _osc(2.0, loop, lag=0.28, samples=12)
+        breath = _osc(2.8, loop, cycles=2, skew=0.4, samples=16)
+        drift = _osc(2.0, loop, lag=0.28, samples=16)
         bones["torso"] = {"translate": _trans(
-            *[(t, drift[i][1] * 0.8, v + 2.8) for i, (t, v) in enumerate(breath)])}
+            *[(t, drift[i][1] * 0.8, v + 2.8) for i, (t, v) in enumerate(breath)],
+            linear=True)}
     if "neck" in available:
-        bones["neck"] = {"rotate": _rot(*_osc(1.3, loop, lag=0.06, cycles=2,
-                                              skew=0.35, samples=12))}
+        bones["neck"] = {"rotate": _rot(linear=True, *_osc(1.3, loop, lag=0.06, cycles=2,
+                                              skew=0.35, samples=16))}
     if "head" in available:
-        fast = _osc(1.0, loop, lag=0.12, cycles=2, skew=0.35, samples=12)
-        slow = _osc(1.7, loop, lag=0.33, samples=12)
+        fast = _osc(1.0, loop, lag=0.12, cycles=2, skew=0.35, samples=16)
+        slow = _osc(1.7, loop, lag=0.33, samples=16)
         bones["head"] = {"rotate": _rot(
-            *[(t, v + slow[i][1]) for i, (t, v) in enumerate(fast)])}
+            *[(t, v + slow[i][1]) for i, (t, v) in enumerate(fast)], linear=True)}
     if "hairBack" in available:
-        bones["hairBack"] = {"rotate": _rot(*_osc(3.1, loop, lag=0.22, samples=12))}
-    _breathe_arms(bones, available, loop, 2.6, lag=0.09, cycles=2, samples=12)
+        bones["hairBack"] = {"rotate": _rot(linear=True, *_osc(3.1, loop, lag=0.22, samples=16))}
+    _breathe_arms(bones, available, loop, 2.6, lag=0.09, cycles=2, samples=16)
     return {"bones": bones}
 
 
@@ -467,8 +476,8 @@ def _idle_glance(available: set[str]) -> dict:
     loop = 6.0
     bones: dict[str, dict] = {}
     if "torso" in available:
-        rise = _osc(3.0, loop, cycles=2, skew=0.36, samples=12)
-        bones["torso"] = {"translate": _trans(*[(t, 0.0, v + 3.0) for t, v in rise])}
+        rise = _osc(3.0, loop, cycles=2, skew=0.36, samples=16)
+        bones["torso"] = {"translate": _trans(*[(t, 0.0, v + 3.0) for t, v in rise], linear=True)}
     if "eyes" in available:
         bones["eyes"] = {"translate": _trans(
             (0, 0, 0), (0.9, 0, 0), (1.35, 2.9, 0), (2.5, 2.6, 0), (2.9, 0, 0),
@@ -488,7 +497,7 @@ def _idle_glance(available: set[str]) -> dict:
         bones["hairBack"] = {"rotate": _rot(
             (0, 0), (1.8, -3.3), (2.8, 1.3), (4.4, 2.9), (5.3, -1.1), (6.0, 0),
         )}
-    _breathe_arms(bones, available, loop, 2.8, lag=0.1, cycles=2, samples=12)
+    _breathe_arms(bones, available, loop, 2.8, lag=0.1, cycles=2, samples=16)
     return {"bones": bones}
 
 
@@ -504,17 +513,17 @@ def _idle_sway(available: set[str]) -> dict:
     loop = 5.4
     bones: dict[str, dict] = {}
     if "torso" in available:
-        side = _osc(3.6, loop, skew=0.2, samples=12)
-        rise = _osc(2.2, loop, cycles=2, lag=0.1, skew=0.36, samples=12)
+        side = _osc(3.6, loop, skew=0.2, samples=16)
+        rise = _osc(2.2, loop, cycles=2, lag=0.1, skew=0.36, samples=16)
         bones["torso"] = {"translate": _trans(
-            *[(t, v, rise[i][1] + 2.2) for i, (t, v) in enumerate(side)])}
+            *[(t, v, rise[i][1] + 2.2) for i, (t, v) in enumerate(side)], linear=True)}
     if "neck" in available:
-        bones["neck"] = {"rotate": _rot(*_osc(-2.2, loop, lag=0.07, samples=12))}
+        bones["neck"] = {"rotate": _rot(linear=True, *_osc(-2.2, loop, lag=0.07, samples=16))}
     if "head" in available:
-        bones["head"] = {"rotate": _rot(*_osc(-1.7, loop, lag=0.13, samples=12))}
+        bones["head"] = {"rotate": _rot(linear=True, *_osc(-1.7, loop, lag=0.13, samples=16))}
     if "hairBack" in available:
-        bones["hairBack"] = {"rotate": _rot(*_osc(6.8, loop, lag=0.26, samples=12))}
-    _breathe_arms(bones, available, loop, 4.5, lag=0.11, samples=12)
+        bones["hairBack"] = {"rotate": _rot(linear=True, *_osc(6.8, loop, lag=0.26, samples=16))}
+    _breathe_arms(bones, available, loop, 4.5, lag=0.11, samples=16)
     return {"bones": bones}
 
 
@@ -549,7 +558,7 @@ def _idle_sigh(available: set[str]) -> dict:
             (0, 0), (1.2, -2.6), (2.4, 2.1), (3.2, 3.4),
             (4.3, -1.7), (5.1, 0.9), (5.6, 0),
         )}
-    _breathe_arms(bones, available, loop, 4.0, lag=0.12, samples=12)
+    _breathe_arms(bones, available, loop, 4.0, lag=0.12, samples=16)
     return {"bones": bones}
 
 
@@ -772,8 +781,13 @@ def _cloth_field(rig: RigResult) -> tuple[float, float]:
 #: mesh vertices are ~28 px apart, so a narrow well simply falls between them and
 #: the fabric ripples through the hand anyway. Measured in a 90 px box centred on
 #: the resting hand, share of it moving: 34% at a 110 px smooth falloff.
-_CONTACT_DEAD_PX = 95.0
-_CONTACT_HOLD_PX = 230.0
+#:
+#: And the radius has to cover the hand, not the hand *bone*. A bone is a point;
+#: the thing resting on the fabric is a whole palm and four fingers, and on this
+#: character the fingertips reach 196-276 px from the bone. At a 95 px dead zone
+#: they sat in open fabric taking the full ripple, which is what squashed them.
+_CONTACT_DEAD_PX = 210.0
+_CONTACT_HOLD_PX = 380.0
 
 
 def _cloth_profile(
@@ -811,7 +825,7 @@ def _cloth_profile(
 
 def cloth_deform(
     rig: RigResult, loop: float, amplitude: float, *,
-    cycles: int = 1, samples: int = 8, lag: float = 0.0, travel: float = 0.55,
+    cycles: int = 1, samples: int = 16, lag: float = 0.0, travel: float = 0.55,
 ) -> dict:
     """Deform timelines that let the garments move without moving a bone.
 
