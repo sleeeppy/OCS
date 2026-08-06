@@ -200,6 +200,15 @@ class RigSettings:
     #: How much alpha a part must already have at a pixel before it may be raised.
     #: Above zero so a part is never grown into territory it does not cover.
     source_alpha_touch_floor: int = 8
+    #: Hold the composite down to the artwork's alpha where the artwork is soft.
+    #:
+    #: The mirror of ``restore_source_alpha``. Every see-through layer is inpainted
+    #: complete, so ``front hair`` and ``back hair`` both carry the loose strands
+    #: beside the face; their alphas stack past the artwork's and the gaps between
+    #: the strands fill in, turning fine hair into a soft dark haze. Only applies
+    #: outside the solid silhouette, so sheer fabric over skin is untouched.
+    #: See ``rig.limit_source_alpha``.
+    limit_source_alpha: bool = True
 
 
     #: Which preset animations to emit, or ``None`` for all of them.

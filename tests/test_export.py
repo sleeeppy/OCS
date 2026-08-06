@@ -465,3 +465,189 @@ def test_curated_draw_order_beats_the_inferred_one(figure):
             for other, j in pos.items():
                 if taxonomy.base_tag(other) == after:
                     assert j < i or True  # only meaningful when they overlap
+
+
+
+
+# ── coverage: what the player draws must be what the artwork says ────
+#
+# Each of these builds its own two-layer case rather than leaning on the shared
+# fixture. The fixture's slices already overlap and it has no stacked
+# semi-transparent layers, so it cannot express any of these defects -- tests
+# written against it passed with the fixes reverted.
+
+
+def _flat(canvas, boxes, alpha=255, rgb=(200, 160, 140)):
+    """One RGBA canvas with the given boxes painted."""
+    import numpy as np
+    img = np.zeros((canvas, canvas, 4), np.uint8)
+    for y0, y1, x0, x1 in boxes:
+        img[y0:y1, x0:x1, :3] = rgb
+        img[y0:y1, x0:x1, 3] = alpha
+    return img
+
+
+def test_a_hole_in_a_part_does_not_cost_it_a_wedge_of_mesh():
+    """A gap inside a part must not delete geometry far beyond the gap.
+
+    ``_contour_points`` traces RETR_EXTERNAL, so a hole contributes no vertices,
+    Delaunay spans it with whatever large triangles the interior grid gives, and
+    the centre test then drops every one of them -- taking a wedge of coverage
+    with a hard straight edge, far bigger than the hole that killed it. Measured
+    on the skirt behind a resting hand: 8317 hole pixels cost it 2821 pixels of
+    mesh, 1508 in the box around the hand, and they rendered as dark polygonal
+    notches of background punched through the skirt.
+    """
+    import cv2
+    import numpy as np
+    import scipy.ndimage as ndi
+
+    from ocs import rig as rig_mod_local
+    from ocs.config import RigSettings as RS
+
+    # A skirt-sized part with a hand-sized hole punched in it, which is the case
+    # this comes from: something resting on the garment, occluding it.
+    mask = np.zeros((400, 400), bool)
+    mask[40:360, 40:360] = True
+    mask[150:240, 160:220] = False
+
+    s = RS()
+    radius = max(1, int(s.outline_dilate_px))
+    dilated = cv2.dilate(
+        mask.astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1,) * 2),
+    ) > 0
+
+    def coverage(triangulation_mask):
+        # Same point set as _mesh_attachment: the outline plus an interior grid.
+        # The grid is what makes the triangles small enough for a hole to catch
+        # their centres, so leaving it out cannot reproduce anything.
+        outline, _ = rig_mod_local._contour_points(
+            triangulation_mask, s.contour_epsilon,
+            min(s.contour_epsilon_max_px, float(radius)))
+        interior = rig_mod_local._interior_points(mask, s.interior_spacing)
+        pts = (np.concatenate([outline, interior], axis=0)
+               if interior.size else outline)
+        tris = rig_mod_local._triangulate(pts, triangulation_mask)
+        covered = np.zeros(mask.shape, np.uint8)
+        for t in tris:
+            cv2.fillConvexPoly(covered, pts[t].round().astype(np.int32), 1)
+        return (covered.astype(bool) & mask).sum() / mask.sum()
+
+    without = coverage(dilated)
+    withfill = coverage(ndi.binary_fill_holes(dilated))
+    # 1.8% here, against 1.2% measured on the real skirt -- the same size of hole
+    # relative to the part, so the same size of wedge.
+    assert without < 0.99, (
+        "the case is meant to reproduce the defect; tracing the unfilled mask "
+        f"covered {without:.1%}, so the test proves nothing")
+    assert withfill > 0.999, f"filling holes still leaves {1 - withfill:.2%} uncovered"
+
+
+def test_a_cut_between_two_slices_of_one_layer_is_bridged():
+    """Sibling pieces must overlap, or the GPU's filtering opens the seam.
+
+    Where OCS cuts a layer the split is hard: one piece ends at alpha 255 and the
+    next begins at 255, which sums to exactly 1 on the canvas, so no check of the
+    layers can see a problem. Sampled bilinearly it does not -- each side ramps
+    over a texel and halfway along both read about 0.5, for
+    1 - (1 - 0.5)(1 - 0.5) = 0.75, and the background comes through the missing
+    quarter. Painting the player's background magenta turned the dark line down
+    the thigh magenta, where ``handwear-r`` is cut into an arm and a leg piece.
+    """
+    import numpy as np
+
+    from ocs import rig as rig_mod_local
+    from ocs.config import RigSettings as RS
+    from ocs.psd_io import Decomposition, Part
+
+    upper = Part(name="topwear@arm_l_upper",
+                 rgba=_flat(200, [(40, 100, 40, 160)])[:, :, :], offset=(0, 0))
+    lower = Part(name="topwear@torso",
+                 rgba=_flat(200, [(100, 160, 40, 160)])[:, :, :], offset=(0, 0))
+    decomp = Decomposition(canvas=(200, 200), parts=[upper, lower],
+                           src_img=_flat(200, [(40, 160, 40, 160)]))
+
+    def solid(p):
+        return p.canvas_rgba(decomp.canvas)[..., 3] >= 250
+
+    before = int((solid(upper) & solid(lower)).sum())
+    a, b = rig_mod_local.close_layer_seams([lower, upper], decomp, RS())
+    after = int((solid(a) & solid(b)).sum())
+
+    assert before == 0, "the cut is meant to be hard, with no overlap to start"
+    assert after > 0, "two slices of one layer still meet edge to edge"
+    # The overlap is the extension width, both ways, along the full cut.
+    assert after >= 120 * RS().layer_extend_px, after
+
+
+def test_a_part_is_not_extended_into_a_gap_another_layer_shows_through():
+    """The bridge is for sibling cuts only, not for gaps showing what is behind.
+
+    The gaps between the fingers of a hand are covered by the skirt behind them,
+    which is a different layer. Extending ``handwear`` across them filled them
+    with the layer's own inpainted background -- 3244 opaque pixels reading as
+    black webbing between the fingers.
+    """
+    import numpy as np
+
+    from ocs import rig as rig_mod_local
+    from ocs.config import RigSettings as RS
+    from ocs.psd_io import Decomposition, Part
+
+    # A hand-like part with a slot in it, over a different layer that fills it.
+    hand = _flat(200, [(40, 160, 60, 140)])
+    hand[80:160, 95:105, 3] = 0                      # the gap between two fingers
+    front = Part(name="handwear-l@arm_l", rgba=hand, offset=(0, 0))
+    behind = Part(name="bottomwear@leg_l",
+                  rgba=_flat(200, [(20, 180, 20, 180)], rgb=(160, 40, 40)),
+                  offset=(0, 0))
+    decomp = Decomposition(canvas=(200, 200), parts=[behind, front],
+                           src_img=_flat(200, [(20, 180, 20, 180)]))
+
+    _, sealed = rig_mod_local.close_layer_seams([behind, front], decomp, RS())
+    gap = np.zeros((200, 200), bool)
+    gap[80:160, 95:105] = True
+    filled = int((sealed.canvas_rgba(decomp.canvas)[..., 3][gap] >= 250).sum())
+    assert filled == 0, f"{filled} px of the gap were packed with the front layer"
+
+
+def test_two_layers_may_not_stack_past_the_artwork_where_it_is_soft():
+    """The wispy-hair fix, and the mirror of ``restore_source_alpha``.
+
+    see-through inpaints every layer complete, so ``front hair`` and ``back hair``
+    both carry the loose strands beside the face. Their alphas stack -- two at 0.5
+    give 0.75 -- and the gaps *between* the strands, transparent in one layer and
+    painted in the other, fill in. Fine hair turns into a soft dark haze that
+    reads as an afterimage of hair rather than hair. Measured over the pixels that
+    differ most there: 631 of 648 are covered by ``back hair`` and 619 by
+    ``front hair``, and the composite averages alpha 163.5 where the artwork has
+    110.2.
+    """
+    import numpy as np
+
+    from ocs import rig as rig_mod_local
+    from ocs.config import RigSettings as RS
+    from ocs.psd_io import Decomposition, Part
+
+    soft_box = [(60, 140, 60, 140)]
+    a = Part(name="front hair", rgba=_flat(200, soft_box, alpha=128), offset=(0, 0))
+    b = Part(name="back hair", rgba=_flat(200, soft_box, alpha=128), offset=(0, 0))
+    decomp = Decomposition(canvas=(200, 200), parts=[b, a],
+                           src_img=_flat(200, soft_box, alpha=128))
+
+    def composite(items):
+        acc = np.zeros((200, 200))
+        for p in items:
+            al = p.canvas_rgba(decomp.canvas)[..., 3] / 255.0
+            acc = al + acc * (1.0 - al)
+        return acc
+
+    src = decomp.src_img[..., 3] / 255.0
+    stacked = composite([b, a])
+    assert stacked.max() > src.max() + 0.1, (
+        "the case is meant to reproduce the defect; the two layers did not stack")
+
+    limited = composite(rig_mod_local.limit_source_alpha([b, a], decomp, RS()))
+    worst = float(np.abs(limited - src).max() * 255)
+    assert worst < 3, f"composite still differs from the artwork by {worst:.0f} levels"

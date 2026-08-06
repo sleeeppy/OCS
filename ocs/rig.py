@@ -436,7 +436,39 @@ def _mesh_attachment(
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1,) * 2),
     ) > 0
 
-    outline, n_hull = _contour_points(outline_mask, s.contour_epsilon, s.contour_epsilon_max_px)
+    # Holes are filled before triangulating, and this is not cosmetic.
+    #
+    # _contour_points traces RETR_EXTERNAL, so a hole contributes no vertices and
+    # Delaunay spans it with whatever large triangles the surrounding grid gives.
+    # _triangulate then drops every one of those whose centre lands in the hole --
+    # and a triangle is far bigger than the hole that killed it, so the part loses
+    # a wedge of coverage reaching well past the gap, with a hard straight edge.
+    #
+    # Measured on ``bottomwear@leg_l``: 8317 hole pixels cost it 2821 pixels of
+    # mesh, 1508 of them in the small box around the hand resting on the skirt --
+    # rendering as dark polygonal notches of background punched through the skirt.
+    #
+    # Spanning a hole costs nothing, because the texture there is transparent and
+    # decides visibility on its own. This does not bridge *concave* boundaries,
+    # which is the case ``_triangulate``'s centre test exists for; fill_holes only
+    # closes regions already enclosed by the part.
+    outline_mask = ndi.binary_fill_holes(outline_mask)
+
+    # The simplification tolerance is what the dilation band can pay for.
+    #
+    # ``approxPolyDP``'s epsilon is the furthest the simplified polygon may sit
+    # from the traced curve, and it cuts *inward* at every convex bump. The curve
+    # was traced ``radius`` pixels outside the real alpha boundary, so a tolerance
+    # up to ``radius`` is free -- the polygon still lands on or outside the alpha.
+    # Beyond that it eats into the part, and those pixels have no geometry, so the
+    # background shows through them. The default 4.0 against a 2 px dilation was
+    # spending twice what it had.
+    #
+    # This is the dark line down the thigh. ``handwear-r`` is cut in two there --
+    # arm above, leg below -- and both halves lost their edge to this, 357 px
+    # between them, which is the seam. Capping at the radius takes it to 219.
+    epsilon_max = min(s.contour_epsilon_max_px, float(radius))
+    outline, n_hull = _contour_points(outline_mask, s.contour_epsilon, epsilon_max)
     if outline.shape[0] < 3:
         return None
     interior = _interior_points(mask, s.interior_spacing)
@@ -719,6 +751,37 @@ def close_layer_seams(
     Only where the *artwork* is solid. The character's own outline is legitimately
     semi-transparent and must stay that way, or the silhouette gains a hard fringe
     and the figure grows by the extension width.
+
+    And only into two kinds of place, because "a few pixels past the edge" is right
+    at a seam and wrong everywhere else.
+
+    **Across the part's own feathered rim** -- pixels it already has some alpha at.
+    The arithmetic above is about a boundary the split turned from one opaque pixel
+    into two half-transparent ones, which always leaves a band of partial alpha to
+    find.
+
+    **Into a sibling slice of the same layer** -- a piece carrying the same base
+    tag. Where OCS itself cut a layer the split is hard, not feathered: one piece
+    ends at alpha 255 and the next begins at 255, so there is no rim to find and the
+    first test alone declines to extend. On the canvas that is fine, the two alphas
+    sum to exactly 1. On the GPU it is not: the texture is sampled bilinearly, so
+    across the cut one piece's alpha ramps 255 -> 0 over a texel while the other
+    ramps 0 -> 255, and halfway along both read about 0.5, for a composite of
+    1 - (1 - 0.5)(1 - 0.5) = 0.75. The background comes through the missing quarter
+    as a hard line, invisible in any nearest-sample check of the layers and obvious
+    in the player. Overlapping the pieces by a few opaque pixels means every sample
+    point has at least one of them at 1.
+
+    Confirmed rather than inferred: painting the player's background magenta turned
+    the dark line down the thigh magenta, where ``handwear-r`` is cut into an arm
+    piece and a leg piece.
+
+    Anywhere else the part has no business growing. A gap it genuinely does not
+    cover has alpha 0 and no sibling behind it, and filling that hides what is
+    supposed to show through. Measured: without these tests the fill put 7469 opaque
+    pixels into the box around the left hand, 3244 of them in ``handwear`` itself --
+    the spaces between the fingers, packed with the layer's own inpainted
+    background, which reads as black webbing between them.
     """
     radius = int(s.layer_extend_px)
     if radius <= 0 or decomp.src_img is None or decomp.src_img.shape[2] < 4:
@@ -728,6 +791,17 @@ def close_layer_seams(
     solid = decomp.src_img[..., 3] >= s.source_alpha_solid_floor
     struct = ndi.generate_binary_structure(2, 2)
 
+    # Where each layer's own slices ended up, so a piece can be told from the
+    # sibling it was cut away from. Keyed by base tag: two slices of one garment
+    # share it, and two different garments never do.
+    siblings: dict[str, np.ndarray] = {}
+    for part in ordered:
+        tag = taxonomy.base_tag(part.name)
+        acc = siblings.get(tag)
+        if acc is None:
+            acc = siblings[tag] = np.zeros((ch, cw), dtype=bool)
+        acc |= part.canvas_rgba(decomp.canvas)[..., 3] >= s.source_alpha_solid_floor
+
     out: list[Part] = []
     for part in ordered:
         alpha = part.rgba[..., 3]
@@ -736,8 +810,7 @@ def close_layer_seams(
             out.append(part)
             continue
 
-        grown = ndi.binary_dilation(core, struct, iterations=radius) & ~core
-        # Clip the artwork's solid mask into this part's own frame.
+        # Clip the canvas-sized masks into this part's own frame.
         x1, y1, _x2, _y2 = part.bbox
         h, w = alpha.shape
         cx1, cy1 = max(0, x1), max(0, y1)
@@ -745,8 +818,24 @@ def close_layer_seams(
         if cx2 <= cx1 or cy2 <= cy1:
             out.append(part)
             continue
-        allowed = np.zeros_like(grown)
-        allowed[cy1 - y1:cy2 - y1, cx1 - x1:cx2 - x1] = solid[cy1:cy2, cx1:cx2]
+
+        def _window(canvas_mask: np.ndarray) -> np.ndarray:
+            win = np.zeros_like(core)
+            win[cy1 - y1:cy2 - y1, cx1 - x1:cx2 - x1] = canvas_mask[cy1:cy2, cx1:cx2]
+            return win
+
+        allowed = _window(solid)
+        # The sibling's territory, minus this piece's own contribution to it.
+        sibling = _window(siblings[taxonomy.base_tag(part.name)]) & ~core
+
+        # A pixel must sit on the part's own rim or in a sibling's territory, and
+        # must not sit in a hole *enclosed* by the part: the gaps between the
+        # fingers of a hand are interior holes a few pixels wide, so a rim reaching
+        # in from both sides would meet in the middle and seal them.
+        rim = alpha > s.source_alpha_touch_floor
+        enclosed = ndi.binary_fill_holes(core) & ~core
+        grown = (ndi.binary_dilation(core, struct, iterations=radius)
+                 & ~core & (rim | sibling) & ~enclosed)
 
         target = grown & allowed
         if not target.any():
@@ -841,6 +930,101 @@ def restore_source_alpha(
             depth_median=part.depth_median, depth=part.depth,
             synthetic=part.synthetic,
             meta={**part.meta, "source_alpha_fixed": int(target.sum())},
+        )
+    return out
+
+
+#: Opacity is held just below 1 so ``log1p(-a)`` stays finite in ``limit_source_alpha``.
+_ALPHA_CEILING = 1.0 - 1e-6
+
+
+def limit_source_alpha(
+    ordered: list[Part], decomp: Decomposition, s: RigSettings
+) -> list[Part]:
+    """Hold the composite down to the artwork's opacity where the artwork is soft.
+
+    ``restore_source_alpha`` handles the composite coming out *less* opaque than
+    the source. This is the other half, and it is the wispy hair.
+
+    see-through returns each layer inpainted complete, so ``front hair`` and
+    ``back hair`` both carry the loose strands beside the face. Neither is wrong
+    on its own -- either one alone would let the hair move -- but they stack:
+
+        1 - (1 - a_front)(1 - a_back)
+
+    Two layers at 0.5 give 0.75, and, worse, the gaps *between* the strands are
+    transparent in one layer and painted in the other, so they fill in. The fine
+    locks the artist drew turn into a soft dark haze that reads as an afterimage
+    of the hair rather than hair. Measured over the pixels that differ most in
+    that region, 631 of 648 are covered by ``back hair`` and 619 by ``front hair``
+    -- nearly all of them by both -- and the composite averages alpha 163.5 where
+    the artwork has 110.2.
+
+    The repair is the same principle the rest of this module runs on: the artwork
+    is the truth. Where it is soft, the layers may not add up past it.
+
+    Rather than pick a layer to sacrifice, every contributor is scaled by one
+    factor, which keeps their relative weights and so keeps the hair's own shape.
+    In optical thickness ``t = -ln(1 - a)`` compositing is a plain sum, so with
+    ``T`` the artwork's thickness the factor is ``k = T / sum(t)`` and each layer
+    becomes ``1 - exp(k * ln(1 - a))``. Closed form, no iteration.
+
+    Only where the artwork is soft. Inside the silhouette it is opaque, so sheer
+    fabric over skin -- which is the same arithmetic but *correct*, both layers
+    genuinely being there -- is left alone.
+    """
+    if decomp.src_img is None or decomp.src_img.shape[2] < 4:
+        return ordered
+
+    cw, ch = decomp.canvas
+    src_alpha = decomp.src_img[..., 3].astype(np.float64) / 255.0
+    soft = src_alpha < (s.source_alpha_solid_floor / 255.0)
+    if not soft.any():
+        return ordered
+
+    def thickness(a: np.ndarray) -> np.ndarray:
+        return -np.log1p(-np.minimum(a, _ALPHA_CEILING))
+
+    total = np.zeros((ch, cw), dtype=np.float64)
+    for part in ordered:
+        total += thickness(part.canvas_rgba(decomp.canvas)[..., 3].astype(np.float64) / 255.0)
+
+    target = thickness(src_alpha)
+    over = soft & (total > target + 1e-9)
+    if not over.any():
+        return ordered
+
+    scale = np.ones((ch, cw), dtype=np.float64)
+    scale[over] = target[over] / total[over]
+
+    out = list(ordered)
+    for i, part in enumerate(ordered):
+        x1, y1, x2, y2 = part.bbox
+        cx1, cy1 = max(0, x1), max(0, y1)
+        cx2, cy2 = min(cw, x2), min(ch, y2)
+        if cx2 <= cx1 or cy2 <= cy1:
+            continue
+        sx, sy = cx1 - x1, cy1 - y1
+        h, w = cy2 - cy1, cx2 - cx1
+
+        window = over[cy1:cy2, cx1:cx2]
+        alpha = part.rgba[sy:sy + h, sx:sx + w, 3]
+        touched = window & (alpha > 0)
+        if not touched.any():
+            continue
+
+        a = np.minimum(alpha.astype(np.float64) / 255.0, _ALPHA_CEILING)
+        thinned = 1.0 - np.exp(scale[cy1:cy2, cx1:cx2] * np.log1p(-a))
+        rgba = part.rgba.copy()
+        target_window = rgba[sy:sy + h, sx:sx + w, 3]
+        target_window[touched] = np.clip(
+            np.rint(thinned[touched] * 255.0), 0, 255
+        ).astype(np.uint8)
+        out[i] = Part(
+            name=part.name, rgba=rgba, offset=part.offset,
+            depth_median=part.depth_median, depth=part.depth,
+            synthetic=part.synthetic,
+            meta={**part.meta, "source_alpha_limited": int(touched.sum())},
         )
     return out
 
@@ -982,6 +1166,10 @@ def build_rig(
         # Before the colour repaint: raising alpha brings pixels above the repaint
         # floors, so they get the right colour as well as the right opacity.
         ordered = restore_source_alpha(ordered, decomp, s)
+    if s.limit_source_alpha:
+        # After the two raises, so it sees the alpha they leave behind, and before
+        # the colour repaint, whose floors should read the final opacity.
+        ordered = limit_source_alpha(ordered, decomp, s)
     if s.restore_source_pixels:
         ordered = restore_source_pixels(ordered, decomp, s)
 
