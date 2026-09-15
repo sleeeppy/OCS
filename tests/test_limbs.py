@@ -182,3 +182,83 @@ def test_region_labels_only_inside_the_silhouette(figure):
     assert len(specs) == len(taxonomy.SKIN_REGIONS)
     assert (labels[~sil] == limbs.UNASSIGNED).all()
     assert (labels[sil] >= 0).all()
+
+
+def test_reslicing_replaces_the_region_instead_of_appending():
+    """A part can be cut twice, and the second cut must not stack suffixes.
+
+    _slice_by_regions assigns a region, then enforce_limb_coverage may carve a
+    mandatory region out of the result. Appending produced
+    ``bottomwear@leg_r_upper@leg_r``, and every reader splits on the *first*
+    separator, so the region became ``leg_r_upper@leg_r`` -- matching no spec.
+    The damage is silent: part_side goes None so the piece drops out of the
+    left/right tally, and bone_for_part falls back to torso, binding a piece of
+    skirt lying over the shin to the trunk so it slides across the leg whenever
+    the torso moves.
+    """
+    naming = taxonomy.PartNaming()
+    once = naming.garment("bottomwear", "leg_r_upper")
+    twice = naming.garment(once, "leg_r")
+
+    assert twice.count(taxonomy.REGION_SEP) == 1, twice
+    assert taxonomy.part_region(twice) == "leg_r"
+    assert taxonomy.part_side(twice) == "right"
+
+    bones = {b.name for b in taxonomy.BONE_TEMPLATE}
+    assert taxonomy.bone_for_part(twice, bones) == "rightLeg"
+
+
+def test_reslicing_keeps_the_left_right_suffix():
+    """The LR suffix is what part_side reads for a layer see-through split."""
+    naming = taxonomy.PartNaming()
+    twice = naming.garment(naming.garment("legwear-l", "leg_l_upper"), "leg_l")
+    assert twice == "legwear-l@leg_l"
+    assert taxonomy.part_side(twice) == "left"
+    assert taxonomy.base_tag(twice) == "legwear"
+
+
+def test_layer_dir_skips_see_throughs_intermediates(tmp_path):
+    """``head.png`` is a crop the second pass runs on, not an output layer.
+
+    It is in BODY_PASS_TAGS but deliberately absent from PART_TAGS, and
+    ``further_extr`` never puts it in the PSD. read_layer_dir imported every PNG,
+    so the recovery path picked it up -- and with no TAG_TO_BONE entry it bound to
+    ``torso``, giving a whole-head rigid quad riding the trunk.
+    """
+    import numpy as np
+    from PIL import Image
+    from ocs import psd_io
+
+    for stem in ("src_img", "src_head", "head", "face", "topwear"):
+        a = np.zeros((32, 32, 4), np.uint8)
+        a[8:24, 8:24] = (200, 180, 170, 255)
+        Image.fromarray(a).save(tmp_path / f"{stem}.png")
+
+    names = {q.name for q in psd_io.read_layer_dir(tmp_path).parts}
+    assert names == {"face", "topwear"}, names
+
+
+def test_a_paired_tag_arriving_unsplit_is_still_split():
+    """Whether handwear arrives split is a property of the run, not the tag.
+
+    --tblr_split is applied by further_extr, the last step of an inference, so an
+    interrupted run yields both sleeves in one layer. Keying the decision off
+    OCS_LR_TAGS alone left it whole, and the bone partition then cut it per pixel
+    by nearest segment rather than by connected component -- which, on a pose with
+    one arm folded to the chin, handed the right sleeve's drape to the *left* arm
+    (genuinely nearer that segment, which runs down to the hand) and rendered it
+    as a detached strip lying across the leg.
+    """
+    assert "handwear" in taxonomy.PAIRED_LR_TAGS
+    assert "handwear" not in taxonomy.OCS_LR_TAGS, "upstream normally splits it"
+    # Everything either side of the pipeline may split is covered.
+    for tag in taxonomy.OCS_LR_TAGS + taxonomy.UPSTREAM_LR_TAGS:
+        assert tag in taxonomy.PAIRED_LR_TAGS, tag
+
+
+def test_already_split_layers_are_left_alone(figure):
+    """When upstream did split, the side suffix is present and OCS must not redo it."""
+    rig, kept = _rig_and_parts(figure)
+    assert any(p.tag == "handwear" and p.side for p in kept), "fixture is pre-split"
+    _parts, report = limbs.partition(figure, kept, rig, RigSettings())
+    assert "handwear" not in report["lr_split"]

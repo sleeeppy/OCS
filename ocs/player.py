@@ -87,7 +87,12 @@ function boot() {{
     }},
     animation: OCS.animation || undefined,
     animations: OCS.animations,
-    premultipliedAlpha: false,
+    // Must match ``pma: true`` in the atlas the packer writes. An explicit
+    // value here overrides the page header, so leaving it false blends
+    // premultiplied texels with the straight-alpha function and every soft edge
+    // picks up a grey halo. See ``atlas._premultiply`` for why the page is
+    // premultiplied in the first place.
+    premultipliedAlpha: true,
     backgroundColor: "#14161a",
     alpha: true,
     showControls: {controls},

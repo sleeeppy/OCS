@@ -34,7 +34,10 @@ class SeeThroughSettings:
 
     ``group_offload`` defaults on: see-through's own README puts the plain path
     at 12-16 GB of VRAM at 1280, which is right at the edge on a 16 GB card,
-    while group offload brings the peak to ~10 GB for a modest speed cost.
+    while group offload brings the peak to ~10 GB for a modest speed cost. On
+    Apple Silicon it is not a nicety -- without it a 1280 run swaps. Only CPU,
+    where there is nothing to offload to, drops the flag. See
+    ``ocs.torch_device.should_group_offload``.
     """
 
     resolution: int = 1280
@@ -46,7 +49,7 @@ class SeeThroughSettings:
     #: tags; OCS handles the rest of the L/R work itself (see ocs.limbs).
     tblr_split: bool = True
 
-    def to_args(self) -> list[str]:
+    def to_args(self, device_type: str = "cuda") -> list[str]:
         args = [
             "--resolution", str(self.resolution),
             "--resolution_depth", str(self.resolution_depth),
@@ -54,7 +57,7 @@ class SeeThroughSettings:
             "--seed", str(self.seed),
             "--save_to_psd",
         ]
-        if self.group_offload:
+        if self.group_offload and device_type in ("cuda", "mps"):
             args.append("--group_offload")
         if self.tblr_split:
             args.append("--tblr_split")
@@ -112,10 +115,49 @@ class RigSettings:
     weight_falloff: float = 2.0
     #: Vertices closer than this to a bone are pinned fully to it.
     weight_pin_px: float = 4.0
+    #: Pool the weights of mesh vertices this close together across attachments.
+    #:
+    #: Each part is weighted against its own candidate bones, so two parts meeting
+    #: along a cut get different answers at the same point and travel apart as soon
+    #: as anything moves -- the seam tears open far wider than close_layer_seams
+    #: overlaps it. Measured L1 weight distance across coincident vertices, out of
+    #: 2.0: 1.559 for back hair against face, 1.194 across the cut in handwear-r.
+    #: See ``rig.weld_shared_vertices``.
+    weld_radius_px: float = 3.0
+    #: Keep each limb as one part spanning its whole chain, instead of cutting it
+    #: at the elbow / knee.
+    #:
+    #: Cutting at a joint makes the two halves separate attachments in separate
+    #: slots, and that boundary is a hard edge in the render however the weights
+    #: are set -- 61.8% of the pixels that came out darker than the source art sat
+    #: on a part's own edge. One mesh spanning the joint has no such boundary and
+    #: still bends, because ``rig._candidate_bones`` already blends a part's own
+    #: bone with its parent and children.
+    #:
+    #: The left/right split is unaffected. That is what requirement 2-2 asks for;
+    #: a part per joint segment was an implementation choice on top of it.
+    merge_limb_slices: bool = True
+    #: How much of the silhouette the *other* layers may cover before a big layer
+    #: stops counting as "the only layer" and keeps its tag restriction.
+    #:
+    #: The escape exists so a lone head-to-toe ``topwear`` can be cut into legs.
+    #: Size alone does not establish loneness: on a seated figure a spread skirt
+    #: covers 73.5% of the silhouette while the other layers still cover 49.8%, and
+    #: releasing it let ``bottomwear`` claim the arm the sleeve already had. A
+    #: genuinely lone layer has others at ~0. See ``limbs._slice_by_regions``.
+    lone_layer_others_max: float = 0.25
     #: Overlap grown onto each partition region so neighbouring parts share a
     #: seam instead of showing a gap when the joint bends. Only used when
     #: ``slice_limb_spanning`` is on.
     seam_allowance_px: int = 8
+    #: How far outside its alpha each mesh outline is traced, in pixels.
+    #:
+    #: One pixel covers the antialiased rim. Two is for the seams: ``_triangulate``
+    #: drops boundary triangles, costing every part 0.6-4.6% of its alpha at its
+    #: own edge, and where two slices of one garment meet both losses land in the
+    #: same place. Overshooting costs nothing -- the extra band is transparent in
+    #: the texture, so it renders as nothing until a neighbour's loss exposes it.
+    outline_dilate_px: int = 2
     #: Cut a limb-spanning layer into one attachment per bone region.
     #:
     #: Off by default, because it causes exactly the artifact it was meant to
@@ -128,6 +170,8 @@ class RigSettings:
     #:
     #: Left/right separation does not depend on this -- that is a real split into
     #: separate layers (requirement 2-2), done before this step.
+    #: When this *is* on, ``merge_limb_slices`` still unions each limb's segments
+    #: into one attachment, so the cut is per limb rather than per joint.
     slice_limb_spanning: bool = False
     #: A partition slice smaller than this fraction of the source layer is
     #: discarded rather than emitted as a sliver attachment.
@@ -141,10 +185,83 @@ class RigSettings:
     #: Where a part is frontmost, the original already holds its exact pixels.
     #: Upstream does this itself for nose and mouth in ``further_extr``.
     restore_source_pixels: bool = True
-    #: Only repaint pixels this opaque. Partly transparent edge pixels in the
-    #: source are a blend with whatever is behind, so copying them there would
-    #: pull the neighbour's colour into the seam.
+    #: Only repaint pixels this opaque, **at the character's outer rim**. A partly
+    #: transparent pixel there is a blend with the background, so copying it in
+    #: would drag background colour into the outline.
     source_pixel_alpha_floor: int = 200
+    #: The same floor away from the outer rim, where a partly transparent pixel is
+    #: a blend with another part of the character rather than the background --
+    #: which is the colour the seam should have. Leaving these un-repainted is what
+    #: puts hairlines along every interior cut. See ``rig.restore_source_pixels``.
+    #:
+    #: There is no reason for this to be high. The argument for a floor at all is
+    #: about the *outer* rim, where a soft pixel is a blend with the background;
+    #: inside the character the soft pixels are exactly the seams that need
+    #: repainting most. Every pixel left below the floor keeps see-through's
+    #: drifted colour, and a part's feathered edge is a continuous 1 px curve, so
+    #: what they add up to is a faint scratch traced along every boundary in the
+    #: figure -- the jaw, each wisp of hair over the face, the hand, the shoulder.
+    #: Sweeping it over the face, counting pixels more than 12 levels from the
+    #: artwork out of 41800:
+    #:
+    #:     floor   >12    >25
+    #:       200  27554  16796   (i.e. no repaint at all)
+    #:        64   2077    724
+    #:        16    132     50
+    #:         8    127     50
+    #:
+    #: 16 takes essentially all of it. Below that the pixels being repainted are
+    #: under 6% opaque and contribute nothing either way.
+    source_pixel_alpha_floor_interior: int = 16
+    #: How opaque a nearer part must be before it stops the part behind it being
+    #: repainted from the source. Near-255 on purpose: a feathered edge at alpha 9
+    #: hides nothing, so letting it claim the pixel leaves the *visible* part
+    #: behind it holding see-through's drifted colour -- a dark line along every
+    #: outline. See ``rig.restore_source_pixels``.
+    source_pixel_claim_floor: int = 250
+    #: Restore the opacity the layer split lost, where the artwork was opaque.
+    #:
+    #: Splitting one antialiased image into layers halves the alpha at every
+    #: internal boundary, so ``collar over sleeve`` composites to 0.75 where the
+    #: artwork was 1.0 and the background shows through the difference. That is the
+    #: dark hairline. See ``rig.restore_source_alpha``.
+    #: Extend every layer's opacity this far past its own edge, inside the artwork.
+    #:
+    #: The fix for visible cuts, and it is arithmetic: splitting one antialiased
+    #: image into layers halves the alpha at each internal boundary, so
+    #: ``collar over sleeve`` composites to 0.75 where the artwork was 1.0 and the
+    #: background shows through. Extending the layer *behind* restores both the
+    #: opacity and the original blend -- raising the front layer instead would show
+    #: its colour alone. Plateaus at 4 px; darkness drops 62%. See
+    #: ``rig.close_layer_seams``.
+    layer_extend_px: int = 4
+    restore_source_alpha: bool = True
+    #: How opaque the *artwork* must be before its alpha is treated as solid and
+    #: copied back. High, so the character's own soft outline -- legitimately
+    #: semi-transparent -- keeps its feathering instead of gaining a hard fringe.
+    source_alpha_solid_floor: int = 250
+    #: How much alpha a part must already have at a pixel before it may be raised.
+    #: Above zero so a part is never grown into territory it does not cover.
+    source_alpha_touch_floor: int = 8
+    #: Hold the composite down to the artwork's alpha where the artwork is soft.
+    #:
+    #: The mirror of ``restore_source_alpha``. Every see-through layer is inpainted
+    #: complete, so ``front hair`` and ``back hair`` both carry the loose strands
+    #: beside the face; their alphas stack past the artwork's and the gaps between
+    #: the strands fill in, turning fine hair into a soft dark haze. Only applies
+    #: outside the solid silhouette, so sheer fabric over skin is untouched.
+    #: See ``rig.limit_source_alpha``.
+    limit_source_alpha: bool = True
+
+
+    #: Which preset animations to emit, or ``None`` for all of them.
+    #:
+    #: The presets assume a standing figure. On a seated character ``walk`` and
+    #: ``jump`` are not merely unflattering, they are meaningless -- there is no
+    #: stride to take -- and ``limb_swing_caps`` correctly shrinks them to almost
+    #: nothing, which leaves the player listing animations that do not move.
+    #: Naming the useful subset is better than shipping dead entries.
+    animations: tuple[str, ...] | None = None
 
 
 @dataclass

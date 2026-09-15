@@ -303,11 +303,67 @@ def load_rig(project: Project) -> skeleton.Rig:
     return skeleton.Rig.from_dict(json.loads(project.rig_path.read_text(encoding="utf-8")))
 
 
+def _apply_upscale(project: Project, decomp: psd_io.Decomposition) -> psd_io.Decomposition:
+    """Re-express the decomposition at the original artwork's resolution.
+
+    see-through infers at a reduced resolution, so its layers -- and every pixel
+    ``restore_source_pixels`` copies back from them -- are softer than the source.
+    A project that recorded an ``upscale_source`` keeps the model's shapes and
+    takes its pixels from the full-size art instead. Re-applied on every load
+    because the layers on disk are still the small ones.
+    """
+    rel = project.state.get("upscale_source")
+    if not rel:
+        return decomp
+    path = project.root / rel
+    if not path.exists():
+        return decomp
+    import numpy as np
+    from PIL import Image as _Image
+    return psd_io.upscale_decomposition(
+        decomp, np.array(_Image.open(path).convert("RGBA")))
+
+
+def load_decomposition(project: Project) -> psd_io.Decomposition:
+    """The project's layers, from wherever this project keeps them.
+
+    Normally that is the PSD see-through wrote. A demo project
+    (``scripts/make_demo_project.py``) has no PSD because the machine has no
+    CUDA to produce one, and rebuilds its synthetic decomposition instead --
+    deterministic, so it re-derives identically on every call.
+    """
+    stored = project.state.get("psd")
+    if stored:
+        return _apply_upscale(project, psd_io.read_decomposition(project.root / stored))
+
+    # A run interrupted before further_extr has the layer PNGs but no PSD.
+    layer_dir = project.state.get("layer_dir")
+    if layer_dir:
+        decomp = psd_io.read_layer_dir(project.root / layer_dir)
+        return _apply_upscale(project, decomp)
+
+    figure = project.state.get("demo")
+    if figure:
+        from . import demo
+        try:
+            return demo.FIGURES[figure]()
+        except KeyError:
+            raise ValueError(
+                f"project {project.id} names demo figure {figure!r}, which no "
+                f"longer exists. Known: {sorted(demo.FIGURES)}"
+            ) from None
+
+    raise ValueError(
+        f"project {project.id} has neither a PSD nor a demo figure to load. "
+        "Run the separation stage, scripts/import_psd.py, or "
+        "scripts/make_demo_project.py."
+    )
+
+
 def resolved_parts(project: Project) -> tuple[psd_io.Decomposition, list[psd_io.Part], skeleton.Rig]:
-    """Re-derive the surviving parts from the stored PSD + review decisions."""
+    """Re-derive the surviving parts from the stored layers + review decisions."""
     s = project.settings()
-    psd = project.root / project.state["psd"]
-    decomp = psd_io.read_decomposition(psd)
+    decomp = load_decomposition(project)
     reports = cleanup.analyze(decomp, s.cleanup)
     kept, _dropped = cleanup.apply_verdicts(
         decomp, reports,
@@ -333,7 +389,7 @@ def preview_partition(project: Project) -> dict:
     return {
         "regions": [s.name for s in specs],
         "report": report,
-        "verify": limbs.verify_limb_separation(_new_parts),
+        "verify": limbs.verify_limb_separation(_new_parts, project.settings().rig),
         "part_count": len(_new_parts),
     }
 
@@ -356,7 +412,7 @@ def run_export(project: Project, on_progress=None) -> dict:
 
     step("separating limbs", 0.20)
     parts, limb_report = limbs.partition(decomp, kept, rig, s.rig)
-    verify = limbs.verify_limb_separation(parts)
+    verify = limbs.verify_limb_separation(parts, s.rig)
 
     step("building meshes and weights", 0.45)
     built = rig_mod.build_rig(decomp, parts, rig, s.rig)
@@ -370,7 +426,9 @@ def run_export(project: Project, on_progress=None) -> dict:
 
     step("writing skeleton.json", 0.85)
     json_path = spine_export.export_skeleton(
-        built, project.export_dir / "skeleton.json", name=project.state.get("name", "character")
+        built, project.export_dir / "skeleton.json",
+        name=project.state.get("name", "character"),
+        animations=list(s.rig.animations) if s.rig.animations else None,
     )
     doc = json.loads(json_path.read_text(encoding="utf-8"))
     problems = spine_export.validate(doc)
