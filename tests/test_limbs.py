@@ -20,14 +20,67 @@ def _rig_and_parts(decomp):
     return rig, kept
 
 
-def test_all_eight_limb_regions_are_produced(figure):
+def test_left_and_right_limbs_are_separate_parts(figure):
+    """Requirement 2-2. Separation is per side, not per joint segment.
+
+    Cutting at the elbow and knee too is what tore in motion, so bending there is
+    the weighted mesh's job now (see RigSettings.slice_limb_spanning).
+    """
     rig, kept = _rig_and_parts(figure)
     parts, _report = limbs.partition(figure, kept, rig, RigSettings())
     result = limbs.verify_limb_separation(parts)
-    assert result["ok"], result["missing_regions"]
+    assert result["ok"], result["missing_limbs"]
+    assert result["parts_per_side"]["left"] > 0
+    assert result["parts_per_side"]["right"] > 0
+
+
+def test_limbs_are_left_whole_by_default(figure):
+    """No upper/lower cut, so nothing can tear at the joint."""
+    rig, kept = _rig_and_parts(figure)
+    parts, report = limbs.partition(figure, kept, rig, RigSettings())
+    assert report["garment_slices"] == {}, "limb layers should not be sliced"
+    for p in parts:
+        if p.tag in taxonomy.ARM_TAGS + taxonomy.LEG_TAGS:
+            assert p.region is None, f"{p.name} was cut into a region"
+
+
+def test_slicing_is_still_available_when_asked_for(figure):
+    """The region cut remains reachable, and still produces all eight regions."""
+    s = RigSettings()
+    s.slice_limb_spanning = True
+    rig, kept = _rig_and_parts(figure)
+    parts, report = limbs.partition(figure, kept, rig, s)
     regions = {p.region for p in parts if p.region}
     for required in taxonomy.MANDATORY_LIMB_REGIONS:
-        assert required in regions
+        assert required in regions, f"{required} missing; slices={report['garment_slices']}"
+
+
+def test_uncut_layers_never_overlap_themselves(figure):
+    """The ghosting cause: a layer drawn twice over the same pixels.
+
+    Slicing added an 8 px seam allowance to every cut, so each piece overlapped its
+    neighbour. Measured on real art the skirt became 7 pieces overlapping itself
+    across 31185 px, and in motion the pieces separated and ghosted.
+    """
+    rig, kept = _rig_and_parts(figure)
+    parts, _ = limbs.partition(figure, kept, rig, RigSettings())
+
+    groups: dict[str, list] = {}
+    for p in parts:
+        src = p.meta.get("sliced_from") or p.meta.get("split_from") or p.name
+        groups.setdefault(src, []).append(p)
+
+    for src, pieces in groups.items():
+        if len(pieces) < 2:
+            continue
+        cover = np.zeros(figure.canvas[::-1], np.int16)
+        for p in pieces:
+            cover += p.canvas_mask(figure.canvas).astype(np.int16)
+        doubled = int((cover > 1).sum())
+        union = int((cover > 0).sum())
+        assert doubled <= 0.01 * max(1, union), (
+            f"{src} overlaps itself on {doubled}/{union} px"
+        )
 
 
 def test_single_blob_single_layer_still_separates(blob_figure):
@@ -37,7 +90,7 @@ def test_single_blob_single_layer_still_separates(blob_figure):
 
     parts, report = limbs.partition(blob_figure, kept, rig, RigSettings())
     result = limbs.verify_limb_separation(parts)
-    assert result["ok"], f"missing {result['missing_regions']}; forced={report['forced']}"
+    assert result["ok"], f"missing {result['missing_limbs']}; forced={report['forced']}"
     assert result["parts_per_side"]["left"] > 0
     assert result["parts_per_side"]["right"] > 0
 
@@ -73,50 +126,13 @@ def test_sides_are_not_swapped(figure):
     assert rig.bones["rightLeg"][0] < rig.bones["leftLeg"][0]
 
 
-def test_a_limb_is_one_part_not_two(figure):
-    """An arm stays whole; it is *not* cut at the elbow.
-
-    This asserts the opposite of what it used to. Cutting at the joint made the
-    two halves separate attachments in separate slots, and that boundary is a hard
-    edge in the render whatever the weights say -- 61.8% of the pixels that came
-    out darker than the source art sat on a part's own edge. A single mesh spanning
-    the joint has no such boundary and still bends, which is what
-    ``test_export.test_limb_meshes_span_their_joint`` checks.
-
-    Left/right separation is unaffected, and that is what requirement 2-2 asks
-    for; a part per joint segment was an implementation choice on top of it.
-    """
+def test_limb_layers_survive_intact(figure):
+    """An arm stays one attachment; the elbow bend comes from weights, not a cut."""
     rig, kept = _rig_and_parts(figure)
     parts, _report = limbs.partition(figure, kept, rig, RigSettings())
-
-    for tag, region in (("handwear-r", "arm_r"), ("handwear-l", "arm_l")):
-        pieces = [p for p in parts if taxonomy.base_tag(p.name) == "handwear"
-                  and p.side == ("right" if region.endswith("_r") else "left")]
-        assert pieces, f"no part for {tag}"
-        regions = {p.region for p in pieces}
-        assert regions == {region}, f"{tag} should be one {region} part, got {regions}"
-
-
-def test_left_and_right_limbs_are_still_separated(figure):
-    """The merge must not weaken requirement 2-2 itself."""
-    rig, kept = _rig_and_parts(figure)
-    parts, _ = limbs.partition(figure, kept, rig, RigSettings())
-    v = limbs.verify_limb_separation(parts, RigSettings())
-    assert v["ok"], v
-    assert not v["missing_regions"]
-    assert v["parts_per_side"]["left"] > 0 and v["parts_per_side"]["right"] > 0
-
-
-def test_joint_split_is_still_available(figure):
-    """Turning the merge off restores the per-segment partition and its check."""
-    rig, kept = _rig_and_parts(figure)
-    s = RigSettings(merge_limb_slices=False)
-    parts, report = limbs.partition(figure, kept, rig, s)
     for source in ("handwear-r", "handwear-l"):
-        pieces = report["garment_slices"].get(source)
-        assert pieces, f"{source} was not cut at the elbow"
-        assert len({taxonomy.part_region(p) for p in pieces}) >= 2
-    assert limbs.verify_limb_separation(parts, s)["ok"]
+        matching = [p for p in parts if p.name == source]
+        assert len(matching) == 1, f"{source} should survive as exactly one part"
 
 
 def test_semantic_regions_prevent_cross_limb_bleed(figure):

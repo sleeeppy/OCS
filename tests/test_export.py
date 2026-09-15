@@ -9,12 +9,13 @@ from ocs import cleanup, limbs, player, rig as rig_mod, skeleton, spine_export, 
 from ocs.config import AtlasSettings, RigSettings
 
 
-def build(decomp):
+def build(decomp, settings: RigSettings | None = None):
+    s = settings or RigSettings()
     reports = cleanup.analyze(decomp)
     kept, _ = cleanup.apply_verdicts(decomp, reports)
     rig = skeleton.guess_rig(decomp, kept)
-    parts, _ = limbs.partition(decomp, kept, rig, RigSettings())
-    return rig_mod.build_rig(decomp, parts, rig, RigSettings()), parts
+    parts, _ = limbs.partition(decomp, kept, rig, s)
+    return rig_mod.build_rig(decomp, parts, rig, s), parts
 
 
 # ── bone frame ───────────────────────────────────────────────────────
@@ -85,45 +86,51 @@ def test_vertex_weights_sum_to_one(figure):
         assert counted == len(att.uvs) // 2
 
 
-def test_limb_meshes_span_their_joint(figure):
-    """An upper arm weighted only to the shoulder cannot bend at the elbow.
+def test_uncut_limb_meshes_are_weighted_across_the_joint(figure):
+    """A whole arm must be weighted to both the shoulder and the elbow.
 
-    Only asserted for tags that actually reach past the joint. ``bottomwear`` is
-    restricted to the upper leg on purpose, so shorts must *not* be weighted to
-    the knee -- that restriction is the fix for weights leaking across limbs.
+    This is what replaced cutting at the joint: one mesh, weights spanning the
+    bend. If it were only weighted to the shoulder, the arm would swing rigidly
+    from it -- the very stiffness meshes exist to avoid.
     """
     built, _ = build(figure)
-    index = {b.name: i for i, b in enumerate(built.bones)}
+    names = [b.name for b in built.bones]
     checked = 0
-    # A merged limb is one mesh from shoulder to wrist, so what has to hold is
-    # that its vertices are weighted to the *joint in the middle* as well as the
-    # chain root. That is what lets it bend, and it is the whole reason the joint
-    # no longer needs a cut.
-    joint_of = {
-        "arm_r": "rightElbow", "arm_l": "leftElbow",
-        "leg_r": "rightKnee",  "leg_l": "leftKnee",
-    }
     for slot in built.slots:
-        region = taxonomy.part_region(slot.part_name)
-        if region not in joint_of:
+        tag = taxonomy.base_tag(slot.part_name)
+        side = taxonomy.part_side(slot.part_name)
+        if tag not in taxonomy.ARM_TAGS + taxonomy.LEG_TAGS or side is None:
             continue
         att = built.attachments[slot.attachment]
         if att.kind != "mesh":
             continue
-
-        # A tag that only reaches part of the limb is never merged (see
-        # Partition._merge_key), so anything that got a merged region does span it.
-        root = next(s for s in taxonomy.MERGED_LIMB_REGIONS if s.name == region).bone
-        joint = joint_of[region]
-        if root in index:
-            assert index[root] in att.bones_used, f"{slot.name} is not weighted to {root}"
-        if joint in index:
-            assert index[joint] in att.bones_used, (
-                f"{slot.name} spans {region} but is not weighted to {joint}, "
-                "so the joint cannot bend"
-            )
-            checked += 1
+        used = {names[i] for i in att.bones_used}
+        root_bone = f"{side}{'Arm' if tag in taxonomy.ARM_TAGS else 'Leg'}"
+        mid_bone = f"{side}{'Elbow' if tag in taxonomy.ARM_TAGS else 'Knee'}"
+        assert root_bone in used, f"{slot.name} not weighted to {root_bone} (has {used})"
+        assert mid_bone in used, f"{slot.name} not weighted to {mid_bone} (has {used})"
+        checked += 1
     assert checked, "no limb meshes were checked -- fixture or taxonomy changed"
+
+
+def test_torso_garments_reach_both_hips(figure):
+    """A skirt spans the trunk and both hips, so its weights must too.
+
+    Layers are no longer cut per region, so without this a skirt would ride a
+    single hip and swing off-centre.
+    """
+    built, _ = build(figure)
+    names = [b.name for b in built.bones]
+    for slot in built.slots:
+        if taxonomy.base_tag(slot.part_name) != "bottomwear":
+            continue
+        att = built.attachments[slot.attachment]
+        if att.kind != "mesh":
+            continue
+        used = {names[i] for i in att.bones_used}
+        assert {"leftLeg", "rightLeg"} <= used, f"{slot.name} only reaches {used}"
+        return
+    raise AssertionError("fixture has no bottomwear mesh")
 
 
 def test_weights_never_cross_between_arm_and_leg(figure):
@@ -332,7 +339,10 @@ def test_validate_rejects_a_short_translate_curve(figure):
     spine_export.add_animations(doc, built, ["idle"])
     assert spine_export.validate(doc) == []
 
-    doc["animations"]["idle"]["bones"]["torso"]["translate"][0]["curve"] = [0.1, 0, 0.3, 1]
+    # Any two-channel timeline will do; idle drives breath from the neck.
+    bones = doc["animations"]["idle"]["bones"]
+    target = next(b for b, tl in bones.items() if "translate" in tl)
+    bones[target]["translate"][0]["curve"] = [0.1, 0, 0.3, 1]
     problems = spine_export.validate(doc)
     assert any("needs 8" in p for p in problems), problems
 
@@ -675,7 +685,7 @@ def test_parts_that_meet_agree_on_where_they_are_going(figure):
     from ocs import rig as rig_mod
     from ocs.config import RigSettings
 
-    built, _ = build(figure)
+    built, _ = build(figure, RigSettings(slice_limb_spanning=True))
     names = [sl.name for sl in built.slots
              if built.attachments[sl.name].kind == "mesh"]
 
@@ -854,12 +864,11 @@ def test_touching_slices_of_one_layer_share_a_bone(figure):
     import numpy as np
     import scipy.ndimage as ndi
 
-    from ocs import rig as rig_mod
     from ocs.config import RigSettings
 
-    built, _ = build(figure)
+    s = RigSettings(slice_limb_spanning=True)
+    built, _ = build(figure, s)
     names = [b.name for b in built.bones]
-    s = RigSettings()
 
     meshed = [sl for sl in built.slots
               if built.attachments[sl.attachment].kind == "mesh"]
@@ -884,26 +893,15 @@ def test_touching_slices_of_one_layer_share_a_bone(figure):
                 assert far.bone in used, (
                     f"{near.name} is cut against {far.name} but is not weighted to "
                     f"{far.bone}, so the cut tears when {far.bone} moves")
-    assert checked, "fixture should contain two touching slices of one layer"
+    assert checked, "sliced fixture should contain two touching slices of one layer"
 
 
-def test_a_limb_resting_on_something_barely_moves(figure):
-    """A hand lying on a skirt must not slide, or it leaves its shadow behind.
+def test_a_resting_limb_is_not_welded_to_the_body(figure):
+    """A hand on a skirt may still breathe; pinning it welded the sleeve.
 
-    The artwork has the contact painted in -- the shadow the hand casts, the
-    fabric compressed under it -- and all of that belongs to the layer
-    underneath, which travels with a different bone. Slide the hand and it leaves
-    its own shadow where it was, so you see the hand's edge and a second copy of
-    it a few pixels away. That is the outline that trails the arm.
-
-    It takes very little movement. The idle swings ``leftArm`` 2.2 deg over a
-    498 px arm, so the hand crosses 19 px of skirt whose painted shadow crosses
-    none. Differencing two frames of the idle lit up the whole forearm and hand
-    against a barely-changed skirt; capped, the arm goes dark and only the
-    skirt's own folds move.
-
-    A constraint from the rig, not a change to the gesture: the presets are
-    untouched and a free limb keeps its full swing.
+    ``_planted_tips`` still finds the contact so cloth can hold the fabric, but
+    ``limb_swing_caps`` no longer flattens the arm to a pixel of travel -- that
+    made the figure read as a photograph with a moving chest.
     """
     import math
 
@@ -919,9 +917,12 @@ def test_a_limb_resting_on_something_barely_moves(figure):
     pos = {b.name: (b.world_x, b.world_y) for b in built.bones}
     for bone, tip in planted:
         reach = math.dist(pos[bone], pos[tip])
-        travel = reach * math.radians(caps[bone][0])
-        assert travel <= spine_export._PLANTED_TRAVEL_PX + 1e-6, (
-            f"{bone} rests on something but its tip still travels {travel:.1f} px")
+        travel = max(
+            reach * math.radians(caps[bone][0]),
+            reach * math.radians(caps[bone][1]),
+        )
+        assert travel > 2.0, (
+            f"{bone} is pinned to {travel:.1f} px of travel, welding the sleeve")
 
 
 def test_the_atlas_asks_for_mipmaps(figure):
@@ -1148,7 +1149,7 @@ def test_a_moving_arm_does_not_tear_the_seams_it_crosses(figure):
     from ocs import rig as rig_mod
     from ocs.config import RigSettings
 
-    built, _ = build(figure)
+    built, _ = build(figure, RigSettings(slice_limb_spanning=True))
     index = {b.name: i for i, b in enumerate(built.bones)}
 
     # Vertex weights must agree wherever two meshes meet, whatever the pose --

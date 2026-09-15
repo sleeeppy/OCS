@@ -147,7 +147,8 @@ class RigSettings:
     #: genuinely lone layer has others at ~0. See ``limbs._slice_by_regions``.
     lone_layer_others_max: float = 0.25
     #: Overlap grown onto each partition region so neighbouring parts share a
-    #: seam instead of showing a gap when the joint bends.
+    #: seam instead of showing a gap when the joint bends. Only used when
+    #: ``slice_limb_spanning`` is on.
     seam_allowance_px: int = 8
     #: How far outside its alpha each mesh outline is traced, in pixels.
     #:
@@ -157,6 +158,21 @@ class RigSettings:
     #: same place. Overshooting costs nothing -- the extra band is transparent in
     #: the texture, so it renders as nothing until a neighbour's loss exposes it.
     outline_dilate_px: int = 2
+    #: Cut a limb-spanning layer into one attachment per bone region.
+    #:
+    #: Off by default, because it causes exactly the artifact it was meant to
+    #: avoid. A weighted mesh does not need cutting: the weights blend the motion
+    #: across a joint smoothly, which is how skirts and long hair are rigged in
+    #: practice. Cutting instead produces pieces that each follow one bone, so as
+    #: soon as anything moves the cut lines tear and ghost. Measured on one
+    #: character, the skirt was split into 7 pieces overlapping itself across
+    #: 31185 px, and the seams were plainly visible in motion.
+    #:
+    #: Left/right separation does not depend on this -- that is a real split into
+    #: separate layers (requirement 2-2), done before this step.
+    #: When this *is* on, ``merge_limb_slices`` still unions each limb's segments
+    #: into one attachment, so the cut is per limb rather than per joint.
+    slice_limb_spanning: bool = False
     #: A partition slice smaller than this fraction of the source layer is
     #: discarded rather than emitted as a sliver attachment.
     min_slice_fraction: float = 0.02

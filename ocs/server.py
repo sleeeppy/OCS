@@ -86,6 +86,7 @@ def health() -> dict:
         "ok": True,
         "started_at": _STARTED_AT,
         "stale_modules": stale,
+        "recovered_projects": _ORPHANS,
         "environment": seethrough.check_environment(),
         "taxonomy": {
             "part_tags": list(taxonomy.PART_TAGS),
@@ -319,7 +320,35 @@ def download(project_id: str, kind: str) -> FileResponse:
 # static
 # --------------------------------------------------------------------------
 
+def _reconcile_orphans() -> list[str]:
+    """Fail any project left mid-separation by a previous process.
+
+    The see-through pass is owned by a background thread. If the server dies
+    while one is running -- a restart to pick up a code change, a crash -- the
+    thread goes with it but ``state.json`` still says ``separating``, so the UI
+    shows a progress bar that will never move and offers no way out. Observed on a
+    real upload: it stopped at 76% with layerdiff finished and no PSD written.
+    """
+    recovered: list[str] = []
+    for entry in pipeline.list_projects():
+        if entry.get("stage") != pipeline.STAGE_SEPARATING:
+            continue
+        try:
+            project = pipeline.Project.load(entry["id"])
+        except (FileNotFoundError, ValueError):
+            continue
+        project.state["error"] = (
+            "The server restarted while layers were being separated, so the job "
+            "was lost. Nothing else is wrong -- run separation again."
+        )
+        project.state["resumable"] = True
+        project.set_stage(pipeline.STAGE_FAILED, "interrupted by a server restart")
+        recovered.append(entry["id"])
+    return recovered
+
+
 ensure_dirs()
+_ORPHANS = _reconcile_orphans()
 app.mount("/files", StaticFiles(directory=str(PROJECTS_DIR)), name="files")
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 

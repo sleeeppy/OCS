@@ -21,6 +21,8 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -34,31 +36,14 @@ _ENV_CACHE: dict | None = None
 
 ProgressFn = Callable[[str, float | None], None]
 
-#: tqdm/diffusers write "  35%|###   | 7/20" to stderr; pull the fraction out so
-#: the UI can show a real bar instead of a spinner.
-_PCT = re.compile(r"(\d{1,3})%\|")
-_STEP = re.compile(r"(\d+)/(\d+)")
+#: How many layer PNGs ``apply_layerdiff`` writes on the v3 path: 13 from the body
+#: pass plus 11 from the head-crop pass.
+LAYERDIFF_OUTPUTS = 24
+#: Roughly how many ``{tag}_depth.png`` files ``apply_marigold`` writes.
+MARIGOLD_OUTPUTS = 23
 
-#: Largest ``n/N`` total that can plausibly be an inference-step counter.
-#:
-#: ``_STEP`` matches any progress bar, and the loaders dominate the log: on one
-#: real run, 1038 lines of ``.../517`` (weight tensors) and 394 of ``.../196``
-#: against 55 of ``.../30`` (the actual denoise). A ``517/517`` reads as 100% done,
-#: and combined with the monotonic clamp below that pinned the bar high and
-#: suppressed every genuine step afterwards -- the UI froze at 29% while the run
-#: was 85% through layerdiff. Ignoring implausible totals is what keeps the clamp
-#: from being poisoned by a loader.
-_MAX_STEP_TOTAL = 200
-
-#: How many denoise loops ``apply_layerdiff`` runs, per pass, for tag v3.
-#:
-#: Two, not one. The first covers the body tag list; the second re-runs the whole
-#: schedule on a crop around the head for ``headwear, face, irides, eyebrow,
-#: eyewhite, eyelash, eyewear, ears, earwear, nose, mouth`` (inference_utils.py,
-#: the ``tag_version == 'v3'`` branch). Both report as ``n/30``, so a parser that
-#: assumes one loop climbs to 60% and then jumps *backwards* to 18% when the
-#: second starts -- which is exactly what the UI did.
-_LAYERDIFF_PASSES = 2
+#: Fraction of the bar each phase owns.
+_PHASE_SPAN = {"layerdiff": (0.04, 0.56), "marigold": (0.60, 0.36)}
 
 
 class SeeThroughError(RuntimeError):
@@ -123,15 +108,82 @@ def _error_tail(log_path: str | Path | None, lines: int = 20) -> str:
     return "\n".join(kept[-lines:])
 
 
-def _phase_of(line: str) -> tuple[str, float] | None:
+def _phase_of(line: str) -> str | None:
     low = line.lower()
     if "running layerdiff" in low:
-        return "layerdiff", 0.05
+        return "layerdiff"
     if "running marigold" in low:
-        return "marigold", 0.60
+        return "marigold"
     if "psd saved" in low:
-        return "psd", 0.98
+        return "psd"
     return None
+
+
+def _count_outputs(out_dir: Path) -> tuple[int, int, float]:
+    """(layer PNGs, depth PNGs, newest mtime) written so far."""
+    layers = depths = 0
+    newest = 0.0
+    try:
+        entries = list(out_dir.iterdir())
+    except OSError:
+        return 0, 0, 0.0
+    for p in entries:
+        if p.suffix.lower() != ".png":
+            continue
+        try:
+            newest = max(newest, p.stat().st_mtime)
+        except OSError:
+            pass
+        name = p.name
+        if "_depth" in name:
+            depths += 1
+        elif not name.startswith("src_") and name != "reconstruction.png":
+            layers += 1
+    return layers, depths, newest
+
+
+def _watch_outputs(
+    out_dir: Path, phase: dict, stop: threading.Event, on_progress: ProgressFn
+) -> None:
+    """Report progress from files landing on disk.
+
+    Parsing tqdm does not work here. OCS passes ``--disable_progressbar``, so the
+    only percentages the subprocess prints come from the model *loader*, and a
+    regex looking for "n%" latches onto "Loading pipeline components 100%" and then
+    never changes -- the bar sat at a fixed number for fifteen minutes while the
+    job was in fact running fine, which is indistinguishable from a hang.
+
+    File counts are ground truth: ``apply_layerdiff`` writes one PNG per tag and
+    ``apply_marigold`` one ``_depth`` PNG per part. Reporting the newest write also
+    tells the UI when something last actually happened, which is the question a
+    stalled-looking bar really raises.
+    """
+    last: tuple[int, int] = (-1, -1)
+    while not stop.wait(2.0):
+        layers, depths, newest = _count_outputs(out_dir)
+        current = phase.get("name", "starting")
+        if (layers, depths) == last and current != "starting":
+            # No new file, but say so with the timestamp rather than going silent.
+            idle = time.time() - newest if newest else 0.0
+            if idle > 20:
+                on_progress(f"{current} {_fmt(layers, depths, current)} "
+                            f"(last write {int(idle)}s ago)", None)
+            continue
+        last = (layers, depths)
+        base, span = _PHASE_SPAN.get(current, (0.02, 0.0))
+        done, total = ((layers, LAYERDIFF_OUTPUTS) if current == "layerdiff"
+                       else (depths, MARIGOLD_OUTPUTS))
+        frac = min(1.0, done / total) if total else 0.0
+        on_progress(f"{current} {_fmt(layers, depths, current)}",
+                    min(0.97, base + span * frac))
+
+
+def _fmt(layers: int, depths: int, phase: str) -> str:
+    if phase == "layerdiff":
+        return f"{layers}/{LAYERDIFF_OUTPUTS} layers"
+    if phase == "marigold":
+        return f"{depths}/{MARIGOLD_OUTPUTS} depth maps"
+    return ""
 
 
 def run_inference(
@@ -158,16 +210,15 @@ def run_inference(
             "Run: git submodule update --init --recursive"
         )
 
-    # No --disable_progressbar on purpose. It suppresses exactly the tqdm output
-    # _PCT and _STEP exist to parse, so passing it left the UI on the three coarse
-    # phase jumps below with nothing in between -- tolerable on a card that
-    # finishes in two minutes, not on MPS where a run is far longer. The cost is a
-    # noisier seethrough.log, which is a debug log.
+    # ``--disable_progressbar`` is required: the fraction comes from files
+    # landing on disk (see ``_watch_outputs``), and tqdm's loader bars would
+    # otherwise flood the log that ``_error_tail`` has to filter.
     cmd = [
         PYTHON, str(_RUNNER), str(script),
         "--srcp", str(image_path),
         "--save_dir", str(save_dir),
         *s.to_args(device_type=device_type()),
+        "--disable_progressbar",
     ]
 
     env = dict(os.environ)
@@ -177,61 +228,43 @@ def run_inference(
     if on_progress:
         on_progress("starting see-through", 0.01)
 
+    # Where apply_layerdiff / apply_marigold write their per-tag PNGs.
+    out_dir = save_dir / image_path.stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     log = open(log_path, "w", encoding="utf-8") if log_path else None
+    phase: dict[str, str] = {"name": "starting"}
+    stop = threading.Event()
+    watcher: threading.Thread | None = None
+    if on_progress:
+        watcher = threading.Thread(
+            target=_watch_outputs, args=(out_dir, phase, stop, on_progress), daemon=True
+        )
+        watcher.start()
+
     try:
         proc = subprocess.Popen(
             cmd, cwd=str(SEE_THROUGH_DIR), env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
         )
-        phase, base = "starting", 0.01
-        # Which denoise loop we are in, so two passes over n/30 scale into one bar
-        # rather than the second restarting it. A step lower than the last is the
-        # only available signal that a new loop began.
-        loop, last_step, reported = 0, 0, 0.0
+        # stdout is read only for the phase markers -- plain prints from
+        # inference_psd.py. The fraction comes from the watcher above.
         for line in _stream(proc):
             if log:
                 log.write(line + "\n")
                 log.flush()
             found = _phase_of(line)
             if found:
-                phase, base = found
-                loop, last_step, reported = 0, 0, base
+                phase["name"] = found
                 if on_progress:
-                    on_progress(phase, base)
-                continue
-            if on_progress:
-                m = _STEP.search(line)
-                frac = None
-                if m:
-                    step, total = int(m.group(1)), max(1, int(m.group(2)))
-                    if total <= _MAX_STEP_TOTAL:
-                        if step < last_step:
-                            loop += 1
-                        last_step = step
-                        frac = step / total
-                if frac is None:
-                    # Fall back to the percentage, but only when no step counter
-                    # was present -- a loader's "100%|" would poison the clamp
-                    # exactly like its "517/517" does.
-                    if m is None and (pm := _PCT.search(line)):
-                        frac = int(pm.group(1)) / 100.0
-                if frac is not None:
-                    passes = _LAYERDIFF_PASSES if phase == "layerdiff" else 1
-                    frac = min(1.0, (min(loop, passes - 1) + frac) / passes)
-                    span = 0.55 if phase == "layerdiff" else 0.35
-                    value = min(0.97, base + span * frac)
-                    # Monotonic within a phase. _STEP's (\d+)/(\d+) also matches
-                    # unrelated bars -- "Loading weights: 517/517", "components:
-                    # 5/5" -- which interleave with the denoise steps and would
-                    # otherwise drag the bar backwards. Counting loops alone left
-                    # four such reversals on a real log; refusing to go backwards
-                    # removes all of them without having to classify every bar.
-                    if value >= reported:
-                        reported = value
-                        on_progress(phase, value)
+                    base, _span = _PHASE_SPAN.get(found, (0.98, 0.0))
+                    on_progress(found, base)
         code = proc.wait()
     finally:
+        stop.set()
+        if watcher:
+            watcher.join(timeout=3)
         if log:
             log.close()
 
