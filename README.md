@@ -97,7 +97,7 @@ workspace/projects/<id>/export/
   preview.html      standalone (assets inlined as data URIs)
 ```
 
-Presets include `idle` (and variants), `walk`, `wave`, `jump`, and `turn_head`.
+`idle` is exported by default — it works for any pose. `walk`, `wave`, `jump`, and `turn_head` assume a standing figure; pass `animations=[...]` to `export_skeleton` to include them.
 
 ## No GPU
 

@@ -97,7 +97,7 @@ workspace/projects/<id>/export/
   preview.html      단독 실행 (에셋을 data URI로 인라인)
 ```
 
-프리셋: `idle` (및 변형), `walk`, `wave`, `jump`, `turn_head`.
+기본으로 내보내는 건 `idle`입니다. 어떤 포즈에도 맞습니다. `walk`, `wave`, `jump`, `turn_head`는 서 있는 자세를 가정하니, 쓰려면 `export_skeleton`에 `animations=[...]`를 넘기세요.
 
 ## GPU 없이
 
