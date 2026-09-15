@@ -6,8 +6,14 @@ Turn one character illustration into a rigged, animated **Spine 4.2** skeleton.
 
 Drop in a PNG. OCS decomposes it into layers, lets you drop dummy parts and place bones, then builds a weighted mesh rig, packs an atlas, and hands back a standalone HTML preview.
 
-```
-image → layer decomposition → layer cleanup → bone placement → limb split → rig → Spine + preview
+```mermaid
+flowchart LR
+    A[image] --> B[layer decomposition]
+    B --> C[layer cleanup]
+    C --> D[bone placement]
+    D --> E[limb split]
+    E --> F[rig]
+    F --> G[Spine + preview]
 ```
 
 | 1. Upload | 2. Layer cleanup |
