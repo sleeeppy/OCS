@@ -91,7 +91,7 @@ The first GPU run downloads ~12 GB of model weights. Later runs take a couple of
 3. **Bone placement** — drag the joints. `Shift`+drag moves the subtree, `X` mirrors left↔right, `S` snaps symmetric pairs, `0` fits the view.
 4. **Rig & preview** — weighted meshes, atlas, `skeleton.json`, and a downloadable HTML preview.
 
-`right` means the **character's** right (the viewer's left). Getting this backwards mirrors every animation.
+`right` means the character's right (the viewer's left). Getting this backwards mirrors every animation.
 
 ## Output
 
