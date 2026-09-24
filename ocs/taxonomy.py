@@ -70,6 +70,22 @@ OCS_LR_TAGS = (
     "legwear", "footwear",
 )
 
+#: Every tag that is two things, whichever side of the pipeline splits it.
+#:
+#: Whether ``handwear`` arrives split is a property of the *run*, not the tag:
+#: ``--tblr_split`` is applied by ``further_extr``, which is the last thing an
+#: inference does, so an interrupted run yields both sleeves in one layer. Keying
+#: the decision off ``OCS_LR_TAGS`` alone then leaves it unsplit, and the bone
+#: partition cuts it per pixel by nearest segment instead of by connected
+#: component. On a pose with one arm folded to the chin that assigns the *right*
+#: sleeve's drape to the left arm -- it is genuinely nearer the left arm's segment,
+#: which runs all the way down to the hand -- and the drape renders as a detached
+#: strip lying across the leg.
+#:
+#: So the test is the data, not the tag list: a paired tag with no side suffix
+#: still needs splitting, no matter who was supposed to have done it.
+PAIRED_LR_TAGS = OCS_LR_TAGS + UPSTREAM_LR_TAGS
+
 #: Layers that span more than one bone and must be cut by the bone partition.
 #:
 #: ``handwear`` and ``legwear`` are in here because their names are misleading.
@@ -187,15 +203,63 @@ SKIN_REGIONS: tuple[RegionSpec, ...] = (
     RegionSpec("torso",       "torso",      "neck",       None),
 )
 
-#: The four regions requirement 2-2 is about. ``ocs.limbs`` asserts every one of
-#: these is produced, even for a single-blob silhouette or a symmetric pose.
-MANDATORY_LIMB_REGIONS = (
+#: One merged region per limb, spanning that limb's whole chain.
+#:
+#: Cutting a garment at a joint guarantees a visible seam there: the two slices
+#: become separate attachments in separate slots, and the boundary between them is
+#: a hard edge in the render whatever the weights say. Measured on one character,
+#: 61.8% of the pixels that came out darker than the source art sat on a part's own
+#: edge. A single mesh spanning the joint, with vertices weighted across both
+#: bones, has no such boundary -- and it still bends, which is how a hand-built
+#: Spine rig does it.
+#:
+#: The left/right split stays: the two arms are disjoint and must move
+#: independently. That is also what requirement 2-2 actually asks for.
+LIMB_CHAINS: dict[str, tuple[str, ...]] = {
+    "arm_r": ("arm_r_upper", "arm_r_lower"),
+    "arm_l": ("arm_l_upper", "arm_l_lower"),
+    "leg_r": ("leg_r_upper", "leg_r_lower"),
+    "leg_l": ("leg_l_upper", "leg_l_lower"),
+}
+
+#: Specs for the merged limbs. ``bone`` is the chain root, which the part binds
+#: to; ``rig._candidate_bones`` then pulls in the child joint so vertices near the
+#: elbow blend between the two. These are never used for distance assignment --
+#: merged masks are the *union* of their members' masks, so per-segment accuracy
+#: is unchanged and only the grouping differs.
+MERGED_LIMB_REGIONS: tuple[RegionSpec, ...] = (
+    RegionSpec("arm_r", "rightArm", "rightHand", "right"),
+    RegionSpec("arm_l", "leftArm",  "leftHand",  "left"),
+    RegionSpec("leg_r", "rightLeg", "rightFoot", "right"),
+    RegionSpec("leg_l", "leftLeg",  "leftFoot",  "left"),
+)
+
+#: Everything ``bone_for_part`` / ``part_side`` may be asked to resolve.
+ALL_REGIONS: tuple[RegionSpec, ...] = SKIN_REGIONS + MERGED_LIMB_REGIONS
+
+#: The limbs requirement 2-2 is about: left and right, arms and legs. ``ocs.limbs``
+#: asserts every one is produced, even for a single-blob silhouette or a symmetric
+#: pose. Named per merged limb rather than per segment -- the requirement is
+#: "left/right arms and legs are separated", and demanding a separate part per
+#: joint segment on top of that is what forced the seams.
+MANDATORY_LIMB_REGIONS = ("arm_l", "arm_r", "leg_l", "leg_r")
+
+#: Per-segment form, for a partition that keeps the joint cuts.
+MANDATORY_LIMB_SEGMENTS = (
     "arm_l_upper", "arm_l_lower", "arm_r_upper", "arm_r_lower",
     "leg_l_upper", "leg_l_lower", "leg_r_upper", "leg_r_lower",
 )
 
 ARM_REGIONS = ("arm_r_upper", "arm_r_lower", "arm_l_upper", "arm_l_lower")
 LEG_REGIONS = ("leg_r_upper", "leg_r_lower", "leg_l_upper", "leg_l_lower")
+
+
+def merged_region_of(region: str) -> str | None:
+    """``arm_r_upper`` -> ``arm_r``; ``torso`` -> ``None``."""
+    for merged, members in LIMB_CHAINS.items():
+        if region in members:
+            return merged
+    return None
 
 #: Which regions a tag is allowed to be cut into.
 #:
@@ -282,6 +346,12 @@ TAG_TO_BONE = {
 DRAW_AFTER: dict[str, tuple[str, ...]] = {
     "headwear": ("front hair", "back hair"),
     "front hair": ("face", "ears", "earwear", "neck"),
+    # Back hair is behind the head by definition. Stated because the overlap
+    # inference cannot tell: see-through inpaints the hidden part of the hair, so
+    # over the face the two layers agree and the comparison is a coin toss -- and
+    # it landed on hair-over-face.
+    "face": ("back hair",),
+    "ears": ("back hair",),
     "eyewhite": ("face",),
     "irides": ("face", "eyewhite"),
     "eyelash": ("face", "eyewhite", "irides"),
@@ -337,6 +407,15 @@ def slugify(name: str) -> str:
     return _SLUG_RE.sub("_", name).strip("_").lower()
 
 
+def base_tag_with_side(part_name: str) -> str:
+    """Drop only the region suffix: ``legwear-l@leg_l_upper`` -> ``legwear-l``.
+
+    The LR suffix has to survive -- it is what ``part_side`` reads for a layer
+    see-through split itself.
+    """
+    return part_name.split(REGION_SEP, 1)[0]
+
+
 def base_tag(part_name: str) -> str:
     """Strip LR suffix and region suffix: ``legwear-l@leg_l_upper`` -> ``legwear``."""
     name = part_name.split(REGION_SEP, 1)[0]
@@ -353,7 +432,7 @@ def part_side(part_name: str) -> str | None:
         if head.endswith(suffix):
             return side
     if region:
-        for spec in SKIN_REGIONS:
+        for spec in ALL_REGIONS:
             if spec.name == region:
                 return spec.side
     return None
@@ -368,7 +447,7 @@ def bone_for_part(part_name: str, available_bones: set[str]) -> str:
     """Resolve which bone a part binds to, honouring optional-bone fallbacks."""
     region = part_region(part_name)
     if region:
-        for spec in SKIN_REGIONS:
+        for spec in ALL_REGIONS:
             if spec.name == region:
                 return spec.bone if spec.bone in available_bones else "torso"
 
@@ -404,7 +483,19 @@ class PartNaming:
         return f"{self.skin_prefix}{REGION_SEP}{region}"
 
     def garment(self, tag: str, region: str) -> str:
-        return f"{tag}{REGION_SEP}{region}"
+        """``tag@region``, **replacing** any region the name already carries.
+
+        A part can be cut twice: ``_slice_by_regions`` assigns one, and then
+        ``enforce_limb_coverage`` may carve a mandatory region out of the result.
+        Appending gave ``bottomwear@leg_r_upper@leg_r``, and everything that reads
+        a region splits on the *first* separator, so that name resolved to the
+        region ``leg_r_upper@leg_r`` -- which matches no spec. The consequences are
+        silent and severe: ``part_side`` returns ``None`` so the piece vanishes
+        from the left/right tally, and ``bone_for_part`` falls back to ``torso``,
+        binding a piece of skirt lying over the shin to the *trunk*. It then slides
+        across the leg whenever the torso moves.
+        """
+        return f"{base_tag_with_side(tag)}{REGION_SEP}{region}"
 
     def unique_slug(self, part_name: str) -> str:
         slug = slugify(part_name)
