@@ -69,9 +69,11 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args()
 
+    project = None
     if args.psd:
         psd_path = args.psd.resolve()
         out_path = args.out or psd_path.with_name(psd_path.stem + "_debug.png")
+        decomp = psd_io.read_decomposition(psd_path, load_depth=False)
     else:
         pid = args.project
         if pid is None:
@@ -81,16 +83,23 @@ def main() -> int:
                 return 1
             pid = candidates[-1].parent.name
         project = pipeline.Project.load(pid)
-        psd_path = project.root / project.state["psd"]
         out_path = args.out or project.root / "debug.png"
+        # Goes through the pipeline so a project with no PSD -- a demo one, on a
+        # machine with no CUDA to produce a PSD -- resolves the same way the
+        # server does.
+        decomp = pipeline.load_decomposition(project)
 
-    decomp = psd_io.read_decomposition(psd_path, load_depth=False)
     reports = cleanup.analyze(decomp)
     kept, dropped = cleanup.apply_verdicts(decomp, reports)
     sil = silhouette.character_mask(decomp, kept)
-    rig = skeleton.guess_rig(decomp, kept)
+    # For a project, show the rig that is actually in effect, user edits and all
+    # -- the point of this sheet is what OCS decided, not what it first guessed.
+    if project is not None and project.rig_path.exists():
+        rig = pipeline.load_rig(project)
+    else:
+        rig = skeleton.guess_rig(decomp, kept)
     parts, report = limbs.partition(decomp, kept, rig, RigSettings())
-    verify = limbs.verify_limb_separation(parts)
+    verify = limbs.verify_limb_separation(parts, RigSettings())
 
     print(f"canvas     {decomp.canvas}")
     print(f"cleanup    {cleanup.summarize(reports)}  dropped={dropped}")

@@ -127,12 +127,19 @@ class Partition:
 
     def masks(
         self, allowed: tuple[str, ...] | None = None, seam_px: int = 0,
-        within: np.ndarray | None = None,
+        within: np.ndarray | None = None, merge_limbs: bool = False,
     ) -> dict[str, np.ndarray]:
         """Region name -> mask, optionally grown by a shared seam allowance.
 
         Neighbouring parts are meant to overlap slightly; without it a bent elbow
         shows a wedge of background between the upper arm and the forearm.
+
+        ``merge_limbs`` unions each limb's segment masks into one entry keyed by
+        the merged name (``arm_r_upper | arm_r_lower -> arm_r``). Assignment itself
+        is untouched -- pixels are still matched to the nearest *segment*, so
+        accuracy is identical; only the grouping changes. What it buys is one
+        attachment per limb instead of two, and therefore no cut at the joint to
+        show as a seam.
         """
         labels = self.labels(allowed)
         limit = self.silhouette if within is None else (self.silhouette | within)
@@ -146,14 +153,45 @@ class Partition:
                 k = 2 * seam_px + 1
                 kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
                 mask = (cv2.dilate(mask.astype(np.uint8), kernel) > 0) & limit
-            out[name] = mask
+            key = name
+            if merge_limbs:
+                key = self._merge_key(name, allowed)
+            out[key] = out[key] | mask if key in out else mask
         return out
+
+    def _merge_key(self, name: str, allowed: tuple[str, ...] | None) -> str:
+        """Chain name for ``name``, but only if the caller may span the whole chain.
+
+        ``footwear`` is allowed in ``leg_*_lower`` only, so folding its region into
+        ``leg_l`` would bind a shoe to the hip -- and ``rig._candidate_bones``, which
+        applies the same table, would then strip that bone back out and leave the
+        slot bound to a bone its own mesh is not weighted to. Same for ``topwear``,
+        which reaches the shoulder but not the elbow.
+
+        So merge only where the tag genuinely covers the limb: ``legwear`` and
+        ``handwear``, the layers that *are* whole limbs.
+        """
+        merged = taxonomy.merged_region_of(name)
+        if merged is None:
+            return name
+        members = taxonomy.LIMB_CHAINS[merged]
+        if allowed is not None and not set(members) <= set(allowed):
+            return name
+        if not all(m in self.index for m in members):
+            return name
+        return merged
 
     def _columns(self, allowed: tuple[str, ...] | None) -> list[int]:
         if allowed is None:
             return list(range(len(self.specs)))
         cols = [self.index[n] for n in allowed if n in self.index]
         return cols or list(range(len(self.specs)))
+
+
+def mandatory_limb_regions(s: RigSettings) -> tuple[str, ...]:
+    """Which limb regions must end up covered, given the partition granularity."""
+    return (taxonomy.MANDATORY_LIMB_REGIONS if s.merge_limb_slices
+            else taxonomy.MANDATORY_LIMB_SEGMENTS)
 
 
 def region_labels(
@@ -409,19 +447,22 @@ def partition(
     if skin_area >= min_area and decomp.src_img is not None:
         depth = _skin_depth(parts)
         naming = taxonomy.PartNaming()
-        skin_masks = grid.masks(None, seam_px=s.seam_allowance_px)
-        for spec in grid.specs:
-            sel = _clean_mask(skin & skin_masks[spec.name], min_area=min_area, open_px=1)
+        skin_masks = grid.masks(None, seam_px=s.seam_allowance_px,
+                                merge_limbs=s.merge_limb_slices)
+        # Iterate the mask keys, not grid.specs: with merging the keys are limb
+        # chains (``arm_r``) rather than segments (``arm_r_upper``).
+        for region_name, region_mask in skin_masks.items():
+            sel = _clean_mask(skin & region_mask, min_area=min_area, open_px=1)
             if not sel.any():
                 continue
             p = _crop_to_part(
-                naming.skin(spec.name), decomp.src_img, sel, depth,
-                synthetic=True, meta={"origin": "skin_base", "region": spec.name},
+                naming.skin(region_name), decomp.src_img, sel, depth,
+                synthetic=True, meta={"origin": "skin_base", "region": region_name},
                 min_opaque=min_area,
             )
             if p is not None:
                 result.append(p)
-                report["skin_regions"][spec.name] = int(sel.sum())
+                report["skin_regions"][region_name] = int(sel.sum())
 
     # --- 2. per-layer handling --------------------------------------------
     already_split = {p.tag for p in parts if p.side is not None}
@@ -429,18 +470,24 @@ def partition(
     for part in parts:
         tag = part.tag
 
-        if tag in taxonomy.OCS_LR_TAGS and part.side is None and tag not in already_split:
+        if tag in taxonomy.PAIRED_LR_TAGS and part.side is None and tag not in already_split:
             pieces = split_lr(part, decomp, rig, grid, s.min_slice_fraction)
             if len(pieces) > 1:
                 report["lr_split"].append(part.name)
                 for piece in pieces:
-                    result.extend(_maybe_slice(piece, decomp, grid, s, report))
+                    result.extend(_maybe_slice(
+                        piece, decomp, grid, s, report,
+                        _union_of_others(part, parts, decomp),
+                    ))
                 continue
             result.append(part)
             continue
 
         if tag in taxonomy.LIMB_SPANNING_TAGS:
-            result.extend(_maybe_slice(part, decomp, grid, s, report))
+            result.extend(_maybe_slice(
+                part, decomp, grid, s, report,
+                _union_of_others(part, parts, decomp),
+            ))
             continue
 
         result.append(part)
@@ -455,13 +502,31 @@ def partition(
     return result, report
 
 
+def _union_of_others(part: Part, parts: list[Part], decomp: Decomposition) -> np.ndarray:
+    """Everything except ``part``, as one mask.
+
+    Used to test whether a large layer is genuinely the only one -- the condition
+    the tag-restriction escape in ``_slice_by_regions`` is meant to detect.
+    """
+    out = np.zeros(decomp.canvas[::-1], dtype=bool)
+    for q in parts:
+        if q is not part:
+            out |= q.canvas_mask(decomp.canvas)
+    return out
+
+
 def _maybe_slice(
-    part: Part, decomp: Decomposition, grid: Partition, s: RigSettings, report: dict
+    part: Part,
+    decomp: Decomposition,
+    grid: Partition,
+    s: RigSettings,
+    report: dict,
+    others: np.ndarray | None = None,
 ) -> list[Part]:
     """Cut a limb-spanning layer, or leave it whole for the weights to handle."""
     if not s.slice_limb_spanning:
         return [part]
-    return _slice_by_regions(part, decomp, grid, s, report)
+    return _slice_by_regions(part, decomp, grid, s, report, others)
 
 
 def _slice_by_regions(
@@ -470,6 +535,7 @@ def _slice_by_regions(
     grid: Partition,
     s: RigSettings,
     report: dict,
+    others: np.ndarray | None = None,
 ) -> list[Part]:
     """Cut a limb-spanning layer at its joints, within the regions its tag allows.
 
@@ -489,16 +555,35 @@ def _slice_by_regions(
     # leaves the legs uncuttable. The tag restriction exists to stop *one layer
     # among many* from claiming another limb's geometry, which cannot apply when
     # there is no other layer to claim it.
+    #
+    # Size alone does not establish that, though, and on a seated figure it is
+    # actively wrong: a spread skirt covers 73.5% of the silhouette while the other
+    # layers still cover 49.8% of it, so ``bottomwear`` was released from its tag
+    # restriction and claimed the arm the sleeve was already covering. The
+    # condition the comment above actually describes is *no other layer*, so test
+    # that directly -- for a genuinely lone layer the others cover nothing.
     silhouette_px = int(grid.silhouette.sum())
     if silhouette_px and total >= 0.55 * silhouette_px:
-        allowed = None
+        others_frac = 0.0 if others is None else float(others.sum()) / silhouette_px
+        if others_frac < s.lone_layer_others_max:
+            allowed = None
 
-    masks = grid.masks(allowed, seam_px=s.seam_allowance_px, within=mask)
+    masks = grid.masks(allowed, seam_px=s.seam_allowance_px, within=mask,
+                       merge_limbs=s.merge_limb_slices)
 
     hits = [(name, mask & m) for name, m in masks.items()]
     hits = [(name, m) for name, m in hits if m.sum() >= s.min_slice_fraction * total]
-    if len(hits) <= 1:
+    if not hits:
         return [part]
+    if len(hits) == 1:
+        # Merging turns a limb layer -- ``handwear-r`` is a whole arm -- into a
+        # single hit, and returning it unchanged would drop the ``@region`` suffix
+        # that binds it to its limb bone and that verify_limb_separation counts.
+        # So a lone limb hit is still emitted as an annotated slice; a lone torso
+        # hit is left alone, because renaming e.g. ``back hair`` to
+        # ``back hair@torso`` would rebind it away from TAG_TO_BONE.
+        if hits[0][0] not in taxonomy.LIMB_CHAINS:
+            return [part]
 
     canvas_rgba = part.canvas_rgba(decomp.canvas)
     naming = taxonomy.PartNaming()
@@ -533,9 +618,10 @@ def enforce_limb_coverage(
     """
     covered = {p.region for p in parts if p.region}
     out = list(parts)
-    masks = grid.masks(None, seam_px=s.seam_allowance_px)
+    masks = grid.masks(None, seam_px=s.seam_allowance_px,
+                       merge_limbs=s.merge_limb_slices)
 
-    for region in taxonomy.MANDATORY_LIMB_REGIONS:
+    for region in mandatory_limb_regions(s):
         if region in covered or region not in masks:
             continue
         target_mask = masks[region]
@@ -594,7 +680,9 @@ def enforce_limb_coverage(
     return out
 
 
-def verify_limb_separation(parts: list[Part]) -> dict:
+def verify_limb_separation(
+    parts: list[Part], settings: RigSettings | None = None
+) -> dict:
     """Requirement 2-2's post-condition: arms and legs exist separately per side.
 
     Checks for a distinct left and right part of each limb pair. It deliberately
@@ -602,7 +690,11 @@ def verify_limb_separation(parts: list[Part]) -> dict:
     the weighted mesh's job, and cutting there tears in motion (see
     ``RigSettings.slice_limb_spanning``). When slicing is enabled the region
     breakdown is reported too, but the pass/fail condition stays left-versus-right.
+
+    ``settings`` is accepted for callers that still pass the project rig settings;
+    the pass/fail condition does not depend on them.
     """
+    _ = settings
     sides: dict[str, int] = {"left": 0, "right": 0}
     for p in parts:
         if p.side in sides:
@@ -619,8 +711,12 @@ def verify_limb_separation(parts: list[Part]) -> dict:
                 return True
         return False
 
-    arm_regions = tuple(r for r in taxonomy.ARM_REGIONS)
-    leg_regions = tuple(r for r in taxonomy.LEG_REGIONS)
+    arm_regions = taxonomy.ARM_REGIONS + tuple(
+        name for name in taxonomy.LIMB_CHAINS if name.startswith("arm_")
+    )
+    leg_regions = taxonomy.LEG_REGIONS + tuple(
+        name for name in taxonomy.LIMB_CHAINS if name.startswith("leg_")
+    )
     pairs = {
         "arm": {s: has(taxonomy.ARM_TAGS, arm_regions, s) for s in ("left", "right")},
         "leg": {s: has(taxonomy.LEG_TAGS, leg_regions, s) for s in ("left", "right")},

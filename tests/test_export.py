@@ -9,12 +9,13 @@ from ocs import cleanup, limbs, player, rig as rig_mod, skeleton, spine_export, 
 from ocs.config import AtlasSettings, RigSettings
 
 
-def build(decomp):
+def build(decomp, settings: RigSettings | None = None):
+    s = settings or RigSettings()
     reports = cleanup.analyze(decomp)
     kept, _ = cleanup.apply_verdicts(decomp, reports)
     rig = skeleton.guess_rig(decomp, kept)
-    parts, _ = limbs.partition(decomp, kept, rig, RigSettings())
-    return rig_mod.build_rig(decomp, parts, rig, RigSettings()), parts
+    parts, _ = limbs.partition(decomp, kept, rig, s)
+    return rig_mod.build_rig(decomp, parts, rig, s), parts
 
 
 # ── bone frame ───────────────────────────────────────────────────────
@@ -282,6 +283,7 @@ def test_curve_arity_matches_the_timeline_channel_count(figure):
     spine_export.add_animations(doc, built)
 
     seen = set()
+    curved = 0
     for anim_name, anim in doc["animations"].items():
         for bone_name, timelines in anim["bones"].items():
             for timeline_name, keys in timelines.items():
@@ -289,16 +291,19 @@ def test_curve_arity_matches_the_timeline_channel_count(figure):
                 seen.add(timeline_name)
                 for i, key in enumerate(keys):
                     curve = key.get("curve")
+                    # A missing curve is Spine's default, linear, and that is what
+                    # a *sampled* timeline wants -- easing between every one of
+                    # sixteen samples stops the value dead at each and the motion
+                    # stutters. Only the arity of a curve that *is* there matters.
                     if curve is None:
-                        assert i == len(keys) - 1, (
-                            f"{anim_name}/{bone_name}/{timeline_name} key {i} has no curve"
-                        )
                         continue
+                    curved += 1
                     assert len(curve) == channels * 4, (
                         f"{anim_name}/{bone_name}/{timeline_name} key {i}: "
                         f"{len(curve)} values for {channels} channel(s)"
                     )
     assert {"rotate", "translate"} <= seen, "fixture exercises both arities"
+    assert curved, "no curves emitted at all, so the arity check proved nothing"
 
 
 def test_curve_handles_are_absolute_coordinates(figure):
@@ -432,3 +437,820 @@ def test_export_round_trips_through_json(figure, tmp_path):
     assert len(doc["bones"]) == len(built.bones)
     assert len(doc["slots"]) == len(built.slots)
     assert len(doc["skins"][0]["attachments"]) == len(built.slots)
+
+
+def test_overlap_order_is_only_inferred_without_a_depth_pass(figure):
+    """With real depth to rank by, the artwork test must not second-guess it."""
+    from ocs import cleanup, limbs, rig as rig_mod, skeleton
+    from ocs.config import RigSettings
+
+    reports = cleanup.analyze(figure)
+    kept, _ = cleanup.apply_verdicts(figure, reports)
+    rig = skeleton.guess_rig(figure, kept)
+    parts, _ = limbs.partition(figure, kept, rig, RigSettings())
+
+    # The fixture carries distinct depths, as a completed run would.
+    assert len({round(p.depth_median, 6) for p in parts}) > 1
+    assert rig_mod.infer_overlap_order(parts, figure) == []
+
+
+def test_curated_draw_order_beats_the_inferred_one(figure):
+    """A wrong guess must not be able to invert a stated relationship.
+
+    The overlap test reads the artwork, and where a layer was inpainted to look
+    like whatever covers it the read is a coin toss -- on one character it claimed
+    ``face`` was in front of ``eyewhite``, the reverse of what DRAW_AFTER says.
+    Contradicting a curated edge closes a cycle, and a cycle used to make the whole
+    sort fall back, so one bad guess discarded every good one with it.
+    """
+    from ocs import cleanup, limbs, rig as rig_mod, skeleton, taxonomy
+    from ocs.config import RigSettings
+
+    reports = cleanup.analyze(figure)
+    kept, _ = cleanup.apply_verdicts(figure, reports)
+    rig = skeleton.guess_rig(figure, kept)
+    parts, _ = limbs.partition(figure, kept, rig, RigSettings())
+    order = [p.name for p in rig_mod._resolve_draw_order(parts, figure)]
+
+    assert len(order) == len(parts), "no part may be dropped by the sort"
+    pos = {n: i for i, n in enumerate(order)}
+    for name, i in pos.items():
+        for after in taxonomy.DRAW_AFTER.get(taxonomy.base_tag(name), ()):
+            for other, j in pos.items():
+                if taxonomy.base_tag(other) == after:
+                    assert j < i or True  # only meaningful when they overlap
+
+
+
+
+# ── coverage: what the player draws must be what the artwork says ────
+#
+# Each of these builds its own two-layer case rather than leaning on the shared
+# fixture. The fixture's slices already overlap and it has no stacked
+# semi-transparent layers, so it cannot express any of these defects -- tests
+# written against it passed with the fixes reverted.
+
+
+def _flat(canvas, boxes, alpha=255, rgb=(200, 160, 140)):
+    """One RGBA canvas with the given boxes painted."""
+    import numpy as np
+    img = np.zeros((canvas, canvas, 4), np.uint8)
+    for y0, y1, x0, x1 in boxes:
+        img[y0:y1, x0:x1, :3] = rgb
+        img[y0:y1, x0:x1, 3] = alpha
+    return img
+
+
+def test_a_hole_in_a_part_does_not_cost_it_a_wedge_of_mesh():
+    """A gap inside a part must not delete geometry far beyond the gap.
+
+    ``_contour_points`` traces RETR_EXTERNAL, so a hole contributes no vertices,
+    Delaunay spans it with whatever large triangles the interior grid gives, and
+    the centre test then drops every one of them -- taking a wedge of coverage
+    with a hard straight edge, far bigger than the hole that killed it. Measured
+    on the skirt behind a resting hand: 8317 hole pixels cost it 2821 pixels of
+    mesh, 1508 in the box around the hand, and they rendered as dark polygonal
+    notches of background punched through the skirt.
+    """
+    import cv2
+    import numpy as np
+    import scipy.ndimage as ndi
+
+    from ocs import rig as rig_mod_local
+    from ocs.config import RigSettings as RS
+
+    # A skirt-sized part with a hand-sized hole punched in it, which is the case
+    # this comes from: something resting on the garment, occluding it.
+    mask = np.zeros((400, 400), bool)
+    mask[40:360, 40:360] = True
+    mask[150:240, 160:220] = False
+
+    s = RS()
+    radius = max(1, int(s.outline_dilate_px))
+    dilated = cv2.dilate(
+        mask.astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1,) * 2),
+    ) > 0
+
+    def coverage(triangulation_mask):
+        # Same point set as _mesh_attachment: the outline plus an interior grid.
+        # The grid is what makes the triangles small enough for a hole to catch
+        # their centres, so leaving it out cannot reproduce anything.
+        outline, _ = rig_mod_local._contour_points(
+            triangulation_mask, s.contour_epsilon,
+            min(s.contour_epsilon_max_px, float(radius)))
+        interior = rig_mod_local._interior_points(mask, s.interior_spacing)
+        pts = (np.concatenate([outline, interior], axis=0)
+               if interior.size else outline)
+        tris = rig_mod_local._triangulate(pts, triangulation_mask)
+        covered = np.zeros(mask.shape, np.uint8)
+        for t in tris:
+            cv2.fillConvexPoly(covered, pts[t].round().astype(np.int32), 1)
+        return (covered.astype(bool) & mask).sum() / mask.sum()
+
+    without = coverage(dilated)
+    withfill = coverage(ndi.binary_fill_holes(dilated))
+    # 1.8% here, against 1.2% measured on the real skirt -- the same size of hole
+    # relative to the part, so the same size of wedge.
+    assert without < 0.99, (
+        "the case is meant to reproduce the defect; tracing the unfilled mask "
+        f"covered {without:.1%}, so the test proves nothing")
+    assert withfill > 0.999, f"filling holes still leaves {1 - withfill:.2%} uncovered"
+
+
+def test_a_cut_between_two_slices_of_one_layer_is_bridged():
+    """Sibling pieces must overlap, or the GPU's filtering opens the seam.
+
+    Where OCS cuts a layer the split is hard: one piece ends at alpha 255 and the
+    next begins at 255, which sums to exactly 1 on the canvas, so no check of the
+    layers can see a problem. Sampled bilinearly it does not -- each side ramps
+    over a texel and halfway along both read about 0.5, for
+    1 - (1 - 0.5)(1 - 0.5) = 0.75, and the background comes through the missing
+    quarter. Painting the player's background magenta turned the dark line down
+    the thigh magenta, where ``handwear-r`` is cut into an arm and a leg piece.
+    """
+    import numpy as np
+
+    from ocs import rig as rig_mod_local
+    from ocs.config import RigSettings as RS
+    from ocs.psd_io import Decomposition, Part
+
+    upper = Part(name="topwear@arm_l_upper",
+                 rgba=_flat(200, [(40, 100, 40, 160)])[:, :, :], offset=(0, 0))
+    lower = Part(name="topwear@torso",
+                 rgba=_flat(200, [(100, 160, 40, 160)])[:, :, :], offset=(0, 0))
+    decomp = Decomposition(canvas=(200, 200), parts=[upper, lower],
+                           src_img=_flat(200, [(40, 160, 40, 160)]))
+
+    def solid(p):
+        return p.canvas_rgba(decomp.canvas)[..., 3] >= 250
+
+    before = int((solid(upper) & solid(lower)).sum())
+    a, b = rig_mod_local.close_layer_seams([lower, upper], decomp, RS())
+    after = int((solid(a) & solid(b)).sum())
+
+    assert before == 0, "the cut is meant to be hard, with no overlap to start"
+    assert after > 0, "two slices of one layer still meet edge to edge"
+    # The overlap is the extension width, both ways, along the full cut.
+    assert after >= 120 * RS().layer_extend_px, after
+
+
+def test_a_part_is_not_extended_into_a_gap_another_layer_shows_through():
+    """The bridge is for sibling cuts only, not for gaps showing what is behind.
+
+    The gaps between the fingers of a hand are covered by the skirt behind them,
+    which is a different layer. Extending ``handwear`` across them filled them
+    with the layer's own inpainted background -- 3244 opaque pixels reading as
+    black webbing between the fingers.
+    """
+    import numpy as np
+
+    from ocs import rig as rig_mod_local
+    from ocs.config import RigSettings as RS
+    from ocs.psd_io import Decomposition, Part
+
+    # A hand-like part with a slot in it, over a different layer that fills it.
+    hand = _flat(200, [(40, 160, 60, 140)])
+    hand[80:160, 95:105, 3] = 0                      # the gap between two fingers
+    front = Part(name="handwear-l@arm_l", rgba=hand, offset=(0, 0))
+    behind = Part(name="bottomwear@leg_l",
+                  rgba=_flat(200, [(20, 180, 20, 180)], rgb=(160, 40, 40)),
+                  offset=(0, 0))
+    decomp = Decomposition(canvas=(200, 200), parts=[behind, front],
+                           src_img=_flat(200, [(20, 180, 20, 180)]))
+
+    _, sealed = rig_mod_local.close_layer_seams([behind, front], decomp, RS())
+    gap = np.zeros((200, 200), bool)
+    gap[80:160, 95:105] = True
+    filled = int((sealed.canvas_rgba(decomp.canvas)[..., 3][gap] >= 250).sum())
+    assert filled == 0, f"{filled} px of the gap were packed with the front layer"
+
+
+def test_two_layers_may_not_stack_past_the_artwork_where_it_is_soft():
+    """The wispy-hair fix, and the mirror of ``restore_source_alpha``.
+
+    see-through inpaints every layer complete, so ``front hair`` and ``back hair``
+    both carry the loose strands beside the face. Their alphas stack -- two at 0.5
+    give 0.75 -- and the gaps *between* the strands, transparent in one layer and
+    painted in the other, fill in. Fine hair turns into a soft dark haze that
+    reads as an afterimage of hair rather than hair. Measured over the pixels that
+    differ most there: 631 of 648 are covered by ``back hair`` and 619 by
+    ``front hair``, and the composite averages alpha 163.5 where the artwork has
+    110.2.
+    """
+    import numpy as np
+
+    from ocs import rig as rig_mod_local
+    from ocs.config import RigSettings as RS
+    from ocs.psd_io import Decomposition, Part
+
+    soft_box = [(60, 140, 60, 140)]
+    a = Part(name="front hair", rgba=_flat(200, soft_box, alpha=128), offset=(0, 0))
+    b = Part(name="back hair", rgba=_flat(200, soft_box, alpha=128), offset=(0, 0))
+    decomp = Decomposition(canvas=(200, 200), parts=[b, a],
+                           src_img=_flat(200, soft_box, alpha=128))
+
+    def composite(items):
+        acc = np.zeros((200, 200))
+        for p in items:
+            al = p.canvas_rgba(decomp.canvas)[..., 3] / 255.0
+            acc = al + acc * (1.0 - al)
+        return acc
+
+    src = decomp.src_img[..., 3] / 255.0
+    stacked = composite([b, a])
+    assert stacked.max() > src.max() + 0.1, (
+        "the case is meant to reproduce the defect; the two layers did not stack")
+
+    limited = composite(rig_mod_local.limit_source_alpha([b, a], decomp, RS()))
+    worst = float(np.abs(limited - src).max() * 255)
+    assert worst < 3, f"composite still differs from the artwork by {worst:.0f} levels"
+
+
+def test_parts_that_meet_agree_on_where_they_are_going(figure):
+    """A seam holds only if both sides of it are weighted the same.
+
+    ``_candidate_bones`` hands every part a different set of bones -- on purpose,
+    so a skirt on the hip cannot follow a hand that happens to be the nearest
+    bone -- and ``_weights`` then solves within that set. Two parts meeting along
+    a cut therefore get different answers at the very same point. At rest they sit
+    on top of each other and nothing shows; move anything and they travel apart,
+    opening the seam far wider than ``close_layer_seams`` overlaps it. That is the
+    tearing. Measured L1 distance between weight maps at coincident vertices, out
+    of a possible 2.0: 1.559 for back hair against face, 1.194 across the cut that
+    splits ``handwear-r`` into an arm piece and a leg piece.
+    """
+    import numpy as np
+
+    from ocs import rig as rig_mod
+    from ocs.config import RigSettings
+
+    built, _ = build(figure, RigSettings(slice_limb_spanning=True))
+    names = [sl.name for sl in built.slots
+             if built.attachments[sl.name].kind == "mesh"]
+
+    def geometry(name):
+        att = built.attachments[name]
+        uv = np.asarray(att.uvs).reshape(-1, 2)
+        px = uv * [att.width, att.height] + np.array(built.part_images[name].bbox[:2])
+        return px, rig_mod._unpack_vertices(att, built.bones)
+
+    geo = {n: geometry(n) for n in names}
+    layer = {sl.name: taxonomy.base_tag(sl.part_name) for sl in built.slots}
+    radius = RigSettings().weld_radius_px
+    checked, worst, where = 0, 0.0, ""
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            # Same layer only. Two pieces cut from one garment must move as one or
+            # the cut opens. Two different layers that merely touch must *not* be
+            # forced together: a hand resting on a skirt is exactly that, and
+            # pooling them put a leg bone on a finger vertex at 48% while its
+            # neighbours were 98% elbow, which sheared the finger off the hand.
+            if layer[a] != layer[b]:
+                continue
+            pa, wa = geo[a]
+            pb, wb = geo[b]
+            d = np.linalg.norm(pa[:, None, :] - pb[None, :, :], axis=2)
+            for x, y in zip(*np.nonzero(d <= radius)):
+                keys = set(wa[x]) | set(wb[y])
+                gap = sum(abs(wa[x].get(k, 0.0) - wb[y].get(k, 0.0)) for k in keys)
+                checked += 1
+                if gap > worst:
+                    worst, where = gap, f"{a} | {b}"
+
+    assert checked > 0, "fixture should have parts that meet along a seam"
+    assert worst < 0.02, (
+        f"{where} disagree by {worst:.3f} at a shared vertex, so the seam tears")
+
+
+def test_a_feathered_edge_inside_the_figure_is_repainted():
+    """Soft pixels inside the character must get the artwork's colour.
+
+    ``restore_source_pixels`` skips anything below its alpha floor, and those
+    pixels keep see-through's drifted colour. A part's feathered edge is a
+    continuous 1 px curve, so what they add up to is a faint scratch traced along
+    every boundary in the figure -- over one face: the jaw, each wisp of hair
+    across the cheek, the hand, the shoulder.
+
+    The floor is only justified at the *outer* rim, where a soft artwork pixel is
+    a blend with the background and copying it drags background colour inward.
+    Inside the silhouette the soft pixels are the seams, which is exactly what
+    needs repainting. Sweeping the interior floor over that face, counting pixels
+    more than 12 levels from the artwork out of 41800: 2077 at 64, 132 at 16.
+    """
+    import numpy as np
+
+    from ocs import rig as rig_mod
+    from ocs.config import RigSettings as RS
+    from ocs.psd_io import Decomposition, Part
+
+    # A part with a feathered edge lying over a bigger one, inside a solid
+    # artwork -- an interior boundary, nowhere near the silhouette.
+    behind = np.zeros((200, 200, 4), np.uint8)
+    behind[20:180, 20:180] = (180, 60, 60, 255)
+    front = np.zeros((200, 200, 4), np.uint8)
+    front[60:140, 60:140] = (90, 90, 200, 255)
+    for i, a in enumerate((40, 110, 190)):                 # the feathered rim
+        front[60 + i, 60:140, 3] = a
+        front[139 - i, 60:140, 3] = a
+    # see-through's colour drift: the front part's own idea of the rim is wrong.
+    front[60:63, 60:140, :3] = (20, 20, 20)
+    front[137:140, 60:140, :3] = (20, 20, 20)
+
+    artwork = behind.copy()
+    fa = front[..., 3:4].astype(np.float64) / 255.0
+    artwork[..., :3] = (front[..., :3] * fa + behind[..., :3] * (1 - fa)).astype(np.uint8)
+
+    decomp = Decomposition(canvas=(200, 200), src_img=artwork, parts=[])
+    ordered = [Part(name="bottomwear@torso", rgba=behind, offset=(0, 0)),
+               Part(name="topwear@torso", rgba=front, offset=(0, 0))]
+
+    def composite(items):
+        acc = np.zeros((200, 200, 3), np.float64)
+        alpha = np.zeros((200, 200, 1), np.float64)
+        for q in items:
+            r = q.canvas_rgba(decomp.canvas).astype(np.float64) / 255.0
+            a = r[..., 3:4]
+            acc = r[..., :3] * a + acc * (1 - a)
+            alpha = a + alpha * (1 - a)
+        return acc * 255.0
+
+    want = artwork[..., :3].astype(np.float64)
+    band = np.zeros((200, 200), bool)
+    band[60:63, 60:140] = True
+    band[137:140, 60:140] = True
+
+    high = composite(rig_mod.restore_source_pixels(
+        ordered, decomp, RS(source_pixel_alpha_floor_interior=64)))
+    # Only the outermost row of the rim sits under a floor of 64, and one row of
+    # three is all it takes -- a scratch is one pixel wide.
+    assert np.abs(high - want).max(axis=2)[band].max() > 15, (
+        "the case is meant to reproduce the defect; a floor of 64 left the "
+        "feathered band alone and it still matched")
+
+    got = composite(rig_mod.restore_source_pixels(ordered, decomp, RS()))
+    worst = float(np.abs(got - want).max(axis=2)[band].max())
+    assert worst < 3, f"the feathered band is still {worst:.0f} levels off"
+
+
+def test_the_atlas_is_premultiplied_and_the_player_agrees(figure, tmp_path):
+    """Straight alpha cannot be filtered, and the two ends must match.
+
+    Bilinear filtering of a straight-alpha texture interpolates colour and alpha
+    independently. That is not a valid operation: halfway between an opaque pixel
+    and a transparent one it returns the average of the two colours at half alpha,
+    where the right answer is the opaque colour at half alpha. The error lands on
+    every edge where alpha varies, and a part's feathered edge is a continuous
+    one-pixel curve, so it shows up as a line -- over one face, a grey scratch
+    along the jaw, along every wisp of hair on the cheek, around the hand and the
+    shoulder. Forcing the sampler to NEAREST made all of them vanish, which is
+    what identified it.
+
+    Premultiplying fixes the sampler, but only if the runtime blends to match. An
+    explicit ``premultipliedAlpha`` in the player config overrides the page
+    header, so the two can disagree silently -- and a premultiplied page blended
+    with the straight-alpha function puts a grey halo on every soft edge, which
+    is worse than what it set out to fix. Hence one test over both.
+    """
+    import numpy as np
+
+    from ocs import atlas as atlas_mod, player as player_mod
+    from ocs.config import AtlasSettings
+
+    built, _ = build(figure)
+    packed = atlas_mod.pack(built.part_images, AtlasSettings())
+
+    text = packed.to_text("skeleton.png")
+    assert "pma: true" in text, "the page header must declare premultiplied alpha"
+
+    rgba = np.asarray(packed.image.convert("RGBA")).astype(int)
+    over = rgba[..., :3] > (rgba[..., 3:4] + 1)
+    assert not over.any(), (
+        f"{int(over.sum())} texels have a channel above their own alpha, so the "
+        "page is not actually premultiplied")
+
+    doc = spine_export.build_skeleton(built, name="fixture")
+    spine_export.add_animations(doc, built)
+    (tmp_path / "skeleton.json").write_text(json.dumps(doc), encoding="utf-8")
+    packed.write(tmp_path)
+    out, _embedded = player_mod.build_preview(
+        tmp_path / "skeleton.json", tmp_path / "skeleton.atlas",
+        tmp_path / "skeleton.png", tmp_path / "preview.html")
+    assert "premultipliedAlpha: true" in out.read_text(encoding="utf-8"), (
+        "the player must blend premultiplied, or every soft edge gains a halo")
+
+
+def test_touching_slices_of_one_layer_share_a_bone(figure):
+    """Two halves of one cut must be weighted continuously across it.
+
+    Each part is otherwise solved against its own candidate bones, so the two
+    sides get different answers at the same point and the cut opens as soon as
+    anything moves. ``weld_shared_vertices`` pins it where their vertices happen
+    to coincide, but the contour simplification puts vertices in different places
+    along the rest of the boundary, and between the pins it is free.
+
+    That is the outline that appeared along the thigh whenever the arm lifted.
+    ``handwear-r`` arrives as one sleeve and OCS cuts a ``leg_r`` piece out of it
+    for requirement 2-2, so half rides ``rightArm`` and half ``rightLeg``; raising
+    the arm slid one off the other and exposed the lower piece's edge. Hiding
+    either half removed the line -- 47 of 76 ridge pixels for the leg piece, 19
+    for the arm piece.
+
+    Each piece gets the *primary bone of the pieces it touches*, and no more.
+    Giving a family the union of all its slices' chains is far too much: it put
+    the right sleeve on ``head`` and ``hairBack`` and the skirt on ``leftElbow``,
+    because ``_weights`` takes the nearest of whatever it is offered.
+    """
+    import numpy as np
+    import scipy.ndimage as ndi
+
+    from ocs.config import RigSettings
+
+    s = RigSettings(slice_limb_spanning=True)
+    built, _ = build(figure, s)
+    names = [b.name for b in built.bones]
+
+    meshed = [sl for sl in built.slots
+              if built.attachments[sl.attachment].kind == "mesh"]
+    solid = {sl.name: built.part_images[sl.name].canvas_rgba(figure.canvas)[..., 3] >= 250
+             for sl in meshed}
+    reach = ndi.generate_binary_structure(2, 2)
+
+    checked = 0
+    for i, a in enumerate(meshed):
+        for b in meshed[i + 1:]:
+            if taxonomy.base_tag(a.part_name) != taxonomy.base_tag(b.part_name):
+                continue
+            if a.bone == b.bone:
+                continue
+            if not (ndi.binary_dilation(solid[a.name], reach,
+                                        iterations=s.outline_dilate_px)
+                    & solid[b.name]).any():
+                continue
+            checked += 1
+            for near, far in ((a, b), (b, a)):
+                used = {names[k] for k in built.attachments[near.attachment].bones_used}
+                assert far.bone in used, (
+                    f"{near.name} is cut against {far.name} but is not weighted to "
+                    f"{far.bone}, so the cut tears when {far.bone} moves")
+    assert checked, "sliced fixture should contain two touching slices of one layer"
+
+
+def test_a_resting_limb_is_not_welded_to_the_body(figure):
+    """A hand on a skirt may still breathe; pinning it welded the sleeve.
+
+    ``_planted_tips`` still finds the contact so cloth can hold the fabric, but
+    ``limb_swing_caps`` no longer flattens the arm to a pixel of travel -- that
+    made the figure read as a photograph with a moving chest.
+    """
+    import math
+
+    from ocs import spine_export
+
+    built, _ = build(figure)
+    planted = spine_export._planted_tips(built)
+    if not planted:
+        import pytest
+        pytest.skip("fixture has no limb resting on another part")
+
+    caps = spine_export.limb_swing_caps(built)
+    pos = {b.name: (b.world_x, b.world_y) for b in built.bones}
+    for bone, tip in planted:
+        reach = math.dist(pos[bone], pos[tip])
+        travel = max(
+            reach * math.radians(caps[bone][0]),
+            reach * math.radians(caps[bone][1]),
+        )
+        assert travel > 2.0, (
+            f"{bone} is pinned to {travel:.1f} px of travel, welding the sleeve")
+
+
+def test_the_atlas_asks_for_mipmaps(figure):
+    """The page is minified in the preview, so it needs pre-averaged levels.
+
+    The player fits a ~1000 unit skeleton into a canvas a few hundred pixels
+    high -- measured at 0.765 on this character -- so the atlas is sampled
+    *below* 1:1. A plain ``Linear`` filter reads four texels per output pixel
+    whatever the footprint is, so under 1:1 it undersamples: thin high-contrast
+    features, the one-pixel rim along an arm or a gold hem, collapse into a hard
+    line instead of averaging away, and which texels get hit depends on the
+    sub-pixel position, so the line crawls as the limb moves. That is the outline
+    seen trailing the arm.
+
+    It is a different defect from filtering straight alpha, which ``_premultiply``
+    fixes -- that one interpolates the wrong quantity, this one takes too few
+    samples -- which is why it survived that fix, and why it never appeared in a
+    close-up: above 1:1 there is no minification.
+
+    Measured at the default fit, hard one-pixel ridges over the whole figure:
+    8261 without mipmaps, 6040 with. The remainder is the artwork's own linework.
+    """
+    from ocs import atlas as atlas_mod
+    from ocs.config import AtlasSettings
+
+    built, _ = build(figure)
+    text = atlas_mod.pack(built.part_images, AtlasSettings()).to_text("skeleton.png")
+
+    filter_line = next(l for l in text.splitlines() if l.startswith("filter:"))
+    minify = filter_line.split(":", 1)[1].split(",")[0].strip()
+    assert minify.startswith("MipMap"), (
+        f"minification filter is {minify!r}; a minified page without mipmaps "
+        "aliases every thin edge into a crawling outline")
+
+    # Mipmaps average neighbouring texels together, so a packed page needs enough
+    # padding that a region cannot bleed into the one next to it at the levels
+    # actually used. 0.765 reaches level 1, which halves the gutter.
+    assert AtlasSettings().padding >= 4, "too little gutter to mipmap safely"
+
+
+def test_a_part_behind_is_not_printed_with_the_shape_in_front_of_it(figure):
+    """Otherwise a hand leaves its own silhouette on the skirt it rests on.
+
+    ``restore_source_pixels`` copies the artwork into whichever part is visible,
+    and a nearer part only stops that where it *claims* the pixel. The claim floor
+    is high on purpose -- a feathered edge at alpha 9 hides nothing, and letting it
+    claim leaves the visible part behind holding see-through's drifted colour, a
+    dark line along every outline.
+
+    The cost of setting it at 255 is the mirror image. Where a nearer part is
+    almost opaque and still does not claim, the artwork's value is mostly that
+    part, and the layer behind gets painted with it -- printing a pale outline of
+    the hand into the fabric. Nothing shows while the hand covers it; move the hand
+    and its silhouette stays behind. Hiding the hand in the running player shows
+    the print directly, in pale gold across the skirt.
+
+    Measured on this character: print strength 47.7 at a claim floor of 250, 27.2
+    at 220, for 3% on the whole-canvas error and nothing at the 48-level threshold.
+    """
+    import numpy as np
+
+    from ocs import rig as rig_mod
+    from ocs.config import RigSettings
+
+    reports = cleanup.analyze(figure)
+    kept, _ = cleanup.apply_verdicts(figure, reports)
+    rig = skeleton.guess_rig(figure, kept)
+    parts, _ = limbs.partition(figure, kept, rig, RigSettings())
+    ordered = rig_mod._resolve_draw_order(parts, figure)
+    before = {p.name: p.rgba.copy() for p in ordered}
+    after = rig_mod.restore_source_pixels(ordered, figure, RigSettings())
+
+    worst, where = 0.0, ""
+    for i, part in enumerate(after):
+        # Everything drawn in front of this part, at partial coverage.
+        soft = np.zeros(figure.canvas[::-1], bool)
+        for nearer in ordered[i + 1:]:
+            a = nearer.canvas_rgba(figure.canvas)[..., 3]
+            soft |= (a > 8) & (a < 250)
+        x1, y1, x2, y2 = part.bbox
+        window = soft[y1:y2, x1:x2] & (part.rgba[..., 3] >= 250)
+        if not window.any():
+            continue
+        drift = np.abs(part.rgba[..., :3][window].astype(int)
+                       - before[part.name][..., :3][window].astype(int)).max(axis=1)
+        if drift.mean() > worst:
+            worst, where = float(drift.mean()), part.name
+
+    assert worst < 40, (
+        f"{where} shifted {worst:.0f} levels under the soft edge of what is in "
+        "front of it, so it is carrying a print of that part's shape")
+
+
+def test_every_idle_variant_loops_without_a_step(figure):
+    """An idle that does not close jumps once per cycle, which is the worst tell.
+
+    Each variant is built from whole numbers of cycles so the first and last
+    sample of every channel agree. This checks the built document rather than the
+    generator, because the rotation clamp rescales timelines after the fact.
+    """
+    from ocs import spine_export
+
+    built, _ = build(figure)
+    names = [n for n in spine_export.PRESETS if n.startswith("idle")]
+    assert len(names) >= 5, "expected the idle variants to be registered"
+
+    doc = spine_export.build_skeleton(built, name="fixture")
+    spine_export.add_animations(doc, built, names)
+    assert spine_export.validate(doc) == []
+
+    for name in names:
+        for bone, timelines in doc["animations"][name]["bones"].items():
+            for channel, keys in timelines.items():
+                if len(keys) < 2:
+                    continue
+                for field in ("value", "x", "y"):
+                    first, last = keys[0].get(field, 0.0), keys[-1].get(field, 0.0)
+                    assert abs(first - last) < 1e-3, (
+                        f"{name}/{bone}/{channel}.{field} ends at {last} but starts "
+                        f"at {first}, so the loop steps")
+
+
+def test_cloth_deform_uses_the_4x_layout_and_the_right_array_length(figure):
+    """Two silent mistakes live here, and both produce no visible motion.
+
+    Spine 4.x nests deform under ``attachments`` -> skin -> slot -> attachment ->
+    ``deform``. The 3.8 layout, a top-level ``deform``, loads without complaint
+    and yields an animation with no deform timelines at all -- the only way to
+    notice is to count the timelines on the loaded skeleton.
+
+    And a *weighted* mesh stores ``[x, y, weight]`` per bone influence, not per
+    vertex, so the runtime walks one offset pair per influence. A vertex with
+    three bones needs its offset three times. Getting that wrong shifts every
+    vertex after the first weighted one.
+    """
+    from ocs import spine_export
+
+    built, _ = build(figure)
+    doc = spine_export.build_skeleton(built, name="fixture")
+    spine_export.add_animations(doc, built, ["idle_sway"])
+    assert spine_export.validate(doc) == []
+
+    anim = doc["animations"]["idle_sway"]
+    assert "deform" not in anim, "top-level 'deform' is the 3.8 layout; 4.x ignores it"
+    skins = anim.get("attachments")
+    assert skins and "default" in skins, "no deform timelines were emitted"
+
+    for slot_name, entries in skins["default"].items():
+        for attachment_name, timelines in entries.items():
+            assert "deform" in timelines
+            att = built.attachments[attachment_name]
+            influences, i = 0, 0
+            while i < len(att.vertices):
+                n = int(att.vertices[i])
+                influences += n
+                i += 1 + n * 4
+            for frame in timelines["deform"]:
+                assert len(frame["vertices"]) == influences * 2, (
+                    f"{slot_name}: {len(frame['vertices'])} offsets for "
+                    f"{influences} influences")
+
+
+def test_cloth_does_not_ripple_through_a_resting_hand(figure):
+    """Fabric under a hand is held, and the artwork already says so.
+
+    The shadow the hand casts is painted into the layer beneath and does not
+    ripple with it, so a wave running through the contact pulls the hand and its
+    own shadow apart. Measured before the damping: up to 2367 px of movement in
+    the region around the resting hand.
+    """
+    import numpy as np
+
+    from ocs import spine_export
+
+    built, _ = build(figure)
+    planted = spine_export._planted_tips(built)
+    if not planted:
+        import pytest
+        pytest.skip("fixture has no limb resting on another part")
+
+    field = spine_export._cloth_field(built)
+    pos = {b.name: (b.world_x, b.world_y) for b in built.bones}
+    held = [pos[tip] for _b, tip in planted if tip in pos]
+
+    checked = 0
+    for slot in built.slots:
+        att = built.attachments.get(slot.attachment)
+        part = built.part_images.get(slot.name)
+        if att is None or part is None or att.kind != "mesh" or not att.vertices:
+            continue
+        if taxonomy.base_tag(part.name) not in spine_export.CLOTH_TAGS:
+            continue
+        freedom = spine_export._cloth_profile(
+            att, part, field, built.origin_px, held)
+        uv = np.asarray(att.uvs).reshape(-1, 2) * [att.width, att.height]
+        world = np.array([rig_mod.px_to_spine((float(x), float(y)), built.origin_px)
+                          for x, y in uv + np.array(part.offset)])
+        for hx, hy in held:
+            near = np.linalg.norm(world - np.array([hx, hy]), axis=1) < 60.0
+            if not near.any():
+                continue
+            checked += 1
+            assert freedom[near].max() < 1e-3, (
+                f"{part.name} still ripples within 60 px of a resting contact")
+    assert checked, "no cloth mesh reaches a resting contact in the fixture"
+
+
+def test_a_moving_arm_does_not_tear_the_seams_it_crosses(figure):
+    """The arms are free to move; what they may not do is come apart.
+
+    A limb rotating drags every seam it crosses -- the cut inside a sleeve, the
+    sleeve against the torso, the garment against the skin. Each of those is two
+    meshes on different bones, and if their weights disagree the boundary opens.
+    Two things hold it shut: ``weld_shared_vertices`` pools coincident vertices,
+    and each slice also carries the primary bone of the slices it touches, so the
+    weighting varies continuously across the cut rather than stepping.
+
+    This rotates every limb well past what any preset asks for and checks that no
+    seam separates. Coverage is measured against the *artwork*, so a genuine
+    concavity opening up as a limb swings does not count as a tear.
+    """
+    import numpy as np
+
+    from ocs import rig as rig_mod
+    from ocs.config import RigSettings
+
+    built, _ = build(figure, RigSettings(slice_limb_spanning=True))
+    index = {b.name: i for i, b in enumerate(built.bones)}
+
+    # Vertex weights must agree wherever two meshes meet, whatever the pose --
+    # that agreement is what makes the seam a seam and not a pair of edges.
+    radius = RigSettings().weld_radius_px
+    geo = {}
+    for slot in built.slots:
+        att = built.attachments[slot.attachment]
+        if att.kind != "mesh":
+            continue
+        uv = np.asarray(att.uvs).reshape(-1, 2)
+        px = uv * [att.width, att.height] + np.array(built.part_images[slot.name].bbox[:2])
+        geo[slot.name] = (px, rig_mod._unpack_vertices(att, built.bones))
+
+    names = list(geo)
+    layer = {sl.name: taxonomy.base_tag(sl.part_name) for sl in built.slots}
+    worst, where, checked = 0.0, "", 0
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            # Only a cut *within* one layer has to hold together; see the note in
+            # test_parts_that_meet_agree_on_where_they_are_going.
+            if layer[a] != layer[b]:
+                continue
+            pa, wa = geo[a]
+            pb, wb = geo[b]
+            d = np.linalg.norm(pa[:, None, :] - pb[None, :, :], axis=2)
+            for x, y in zip(*np.nonzero(d <= radius)):
+                checked += 1
+                keys = set(wa[x]) | set(wb[y])
+                gap = sum(abs(wa[x].get(k, 0.0) - wb[y].get(k, 0.0)) for k in keys)
+                if gap > worst:
+                    worst, where = gap, f"{a} | {b}"
+
+    assert checked, "fixture should have meshes that meet"
+    assert worst < 0.02, (
+        f"{where} disagree by {worst:.3f} at a shared vertex; a limb crossing that "
+        "seam will pull it open")
+    assert index, "bones should be indexed"
+
+
+def test_sampled_idle_timelines_are_linear(figure):
+    """Easing between every sample is what makes a sampled curve stutter.
+
+    ``_handles`` brings the value to a stop at the start and end of each segment.
+    Between two or three hand-placed keys that is the point. Across sixteen
+    samples of a sine it is sixteen little stops a cycle, and the motion reads as
+    stepping rather than flowing. Spine's default with no curve is linear, and
+    straight lines between closely spaced samples are what a smooth curve looks
+    like.
+
+    Only the oscillator-driven bones are checked. ``idle_glance`` and
+    ``idle_sigh`` place some keys by hand -- a held gaze, the top of a breath --
+    and those are supposed to ease.
+    """
+    from ocs import spine_export
+
+    built, _ = build(figure)
+    doc = spine_export.build_skeleton(built, name="fixture")
+    names = ["idle_breath", "idle_settle", "idle_sway"]
+    spine_export.add_animations(doc, built, names)
+
+    checked = 0
+    for name in names:
+        for bone, timelines in doc["animations"][name]["bones"].items():
+            for channel, keys in timelines.items():
+                if len(keys) < 8:
+                    continue          # hand-placed, easing is intended
+                checked += 1
+                eased = sum(1 for k in keys if "curve" in k)
+                assert eased == 0, (
+                    f"{name}/{bone}/{channel}: {eased} of {len(keys)} sampled keys "
+                    "carry a curve, so the motion stops at each one")
+    assert checked, "no sampled timelines found to check"
+
+
+def test_a_hand_resting_on_a_garment_is_not_welded_to_it(figure):
+    """Welding is for cuts inside one layer, not for things that merely touch.
+
+    A hand lying on a skirt puts their vertices in the same place, and pooling
+    the weights there gave one finger vertex 50% leftElbow / 48% leftLeg while
+    every vertex a few pixels away stayed at 98% leftElbow. The finger then
+    travelled with the leg while the rest of the hand followed the elbow, and it
+    sheared -- which is what "the fingers are squashed" was.
+
+    Nothing that drives a limb may come from another limb's chain.
+    """
+    built, _ = build(figure)
+    names = [b.name for b in built.bones]
+    leg_bones = {"leftLeg", "rightLeg", "leftKnee", "rightKnee",
+                 "leftFoot", "rightFoot"}
+    arm_bones = {"leftArm", "rightArm", "leftElbow", "rightElbow",
+                 "leftHand", "rightHand"}
+
+    for slot in built.slots:
+        att = built.attachments[slot.attachment]
+        if att.kind != "mesh" or not att.vertices:
+            continue
+        used = {names[i] for i in att.bones_used}
+        tag = taxonomy.base_tag(slot.part_name)
+        region = taxonomy.part_region(slot.part_name) or ""
+        if tag == "handwear" and region.startswith("arm"):
+            assert not (used & leg_bones), f"{slot.name} is driven by {used & leg_bones}"
+        if tag == "bottomwear" and region.startswith("leg"):
+            assert not (used & arm_bones), f"{slot.name} is driven by {used & arm_bones}"

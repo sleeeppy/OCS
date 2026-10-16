@@ -1,17 +1,24 @@
 """Drive the see-through submodule as a subprocess.
 
 Run out-of-process on purpose: it imports torch and loads ~12 GB of diffusion
-weights onto the GPU, and the web server should not carry that. The two share one
-virtualenv (see ``scripts/setup_env.ps1``), so the same interpreter runs both.
+weights onto the accelerator, and the web server should not carry that. The two
+share one virtualenv (see ``scripts/setup_env.sh``), so the same interpreter runs
+both.
 
-``cwd`` must be the submodule root. ``inference_psd.py`` does
-``sys.path.append`` of its own parent and imports ``utils.*`` / ``modules.*``
-from the editable ``common`` install, and its default paths are relative.
+``cwd`` must be the submodule root: ``inference_psd.py``'s default paths are
+relative to it, and ``utils.*`` / ``modules.*`` come from the editable ``common``
+install.
+
+Everything goes through ``scripts/run_seethrough.py`` rather than calling the
+target script directly. see-through hardcodes ``cuda``; that wrapper redirects it
+to whatever this machine has, so the same code path serves an RTX card and an
+Apple Silicon Mac. See :mod:`ocs.torch_device`.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -19,7 +26,13 @@ import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
-from .config import PYTHON, SEE_THROUGH_DIR, SeeThroughSettings
+from .config import PYTHON, REPO_ROOT, SEE_THROUGH_DIR, SeeThroughSettings
+
+#: OCS-owned launcher that sets the device up before importing see-through.
+_RUNNER = REPO_ROOT / "scripts" / "run_seethrough.py"
+
+#: Filled by the first check_environment() call. See its docstring.
+_ENV_CACHE: dict | None = None
 
 ProgressFn = Callable[[str, float | None], None]
 
@@ -47,6 +60,52 @@ def _stream(proc: subprocess.Popen) -> Iterator[str]:
     assert proc.stdout is not None
     for raw in proc.stdout:
         yield raw.rstrip("\r\n")
+
+
+#: tqdm redraw lines. Useful for the progress bar, useless in an error message --
+#: and there are thousands of them, so an unfiltered tail is nothing else.
+_NOISE = re.compile(r"it/s|s/it|Materializing|^\s*$|\x1b\[|^\s*\[A")
+
+
+def _describe_exit(code: int) -> str:
+    """Explain an exit status in the terms the reader needs.
+
+    A negative code is a signal, not a status, and "exited -15" invites a hunt for
+    a bug that is not there: 15 is SIGTERM, i.e. something outside stopped it.
+    """
+    if code < 0:
+        import signal
+
+        try:
+            name = signal.Signals(-code).name
+        except ValueError:
+            name = f"signal {-code}"
+        hint = " (terminated externally, not a see-through failure)" if -code in (
+            signal.SIGTERM, signal.SIGINT
+        ) else ""
+        if -code == signal.SIGKILL:
+            hint = " (killed - usually the OS out-of-memory killer)"
+        return f"see-through was stopped by {name}{hint}"
+    return f"inference_psd.py exited {code}"
+
+
+def _error_tail(log_path: str | Path | None, lines: int = 20) -> str:
+    """Last meaningful lines of the log, with the progress redraws stripped.
+
+    Dropping ``--disable_progressbar`` gave the UI a real progress bar and gave
+    this a 4000-line log of tqdm redraws, so the raw tail showed a wall of
+    ``Loading weights: 100%|###`` instead of the reason. Filter first.
+    """
+    if not log_path or not Path(log_path).exists():
+        return ""
+    raw = Path(log_path).read_text(encoding="utf-8", errors="replace")
+    kept = [
+        ln.rstrip() for ln in raw.replace("\r", "\n").splitlines()
+        if ln.strip() and not _NOISE.search(ln)
+    ]
+    if not kept:
+        return "(no diagnostic output; see the full log)"
+    return "\n".join(kept[-lines:])
 
 
 def _phase_of(line: str) -> str | None:
@@ -151,11 +210,14 @@ def run_inference(
             "Run: git submodule update --init --recursive"
         )
 
+    # ``--disable_progressbar`` is required: the fraction comes from files
+    # landing on disk (see ``_watch_outputs``), and tqdm's loader bars would
+    # otherwise flood the log that ``_error_tail`` has to filter.
     cmd = [
-        PYTHON, str(script),
+        PYTHON, str(_RUNNER), str(script),
         "--srcp", str(image_path),
         "--save_dir", str(save_dir),
-        *s.to_args(),
+        *s.to_args(device_type=device_type()),
         "--disable_progressbar",
     ]
 
@@ -207,10 +269,7 @@ def run_inference(
             log.close()
 
     if code != 0:
-        tail = ""
-        if log_path and Path(log_path).exists():
-            tail = "\n".join(Path(log_path).read_text(encoding="utf-8").splitlines()[-25:])
-        raise SeeThroughError(f"inference_psd.py exited {code}\n{tail}")
+        raise SeeThroughError(f"{_describe_exit(code)}\n{_error_tail(log_path)}")
 
     psd = psd_path_for(image_path, save_dir)
     if not psd.exists():
@@ -233,7 +292,7 @@ def run_lr_split(
     psd_path = Path(psd_path).resolve()
     script = SEE_THROUGH_DIR / "inference" / "scripts" / "heuristic_partseg.py"
     cmd = [
-        PYTHON, str(script), "seg_wlr",
+        PYTHON, str(_RUNNER), str(script), "seg_wlr",
         "--srcp", str(psd_path),
         "--target_tags", ",".join(tags),
     ]
@@ -250,31 +309,59 @@ def run_lr_split(
     return psd_path.with_name(psd_path.stem + "_lrsplit.psd")
 
 
-def check_environment() -> dict:
-    """Report whether the GPU half of the stack is usable, without importing torch here."""
+def device_type() -> str:
+    """``"cuda"`` / ``"mps"`` / ``"cpu"``, or ``"none"`` when torch is absent.
+
+    Cheap enough to call per request: it reads the cached probe below.
+    """
+    return (check_environment().get("device") or "none:").split(":")[0]
+
+
+def check_environment(refresh: bool = False) -> dict:
+    """Report whether the decomposition stage is usable on this machine.
+
+    Runs out-of-process so the web server never imports torch. Reports whatever
+    accelerator exists rather than CUDA specifically -- on an Apple Silicon Mac
+    ``ok`` is true with ``device: "mps"``, and only a machine with no accelerator
+    at all (or no torch) comes back false.
+
+    Cached, because the probe costs a subprocess that imports torch -- a couple of
+    seconds -- and ``/api/health`` is polled. What it reports cannot change while
+    the process runs, short of someone installing torch underneath it, so
+    ``refresh=True`` exists for that case.
+    """
+    global _ENV_CACHE
+    if _ENV_CACHE is not None and not refresh:
+        return _ENV_CACHE
+
     probe = (
-        "import json,torch;"
-        "print(json.dumps({"
-        "'torch': torch.__version__,"
-        "'cuda': torch.cuda.is_available(),"
-        "'device': torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,"
-        "'capability': list(torch.cuda.get_device_capability(0)) if torch.cuda.is_available() else None,"
-        "'vram_gb': round(torch.cuda.get_device_properties(0).total_memory/2**30,1) if torch.cuda.is_available() else None"
-        "}))"
+        "import json,sys;"
+        "sys.path.insert(0, %r);"
+        "from ocs import torch_device;"
+        "d = torch_device.select_device();"
+        "print(json.dumps(torch_device.describe(d)))" % str(REPO_ROOT)
     )
     try:
         out = subprocess.run(
             [PYTHON, "-c", probe], capture_output=True, text=True, timeout=120,
         )
         if out.returncode != 0:
-            return {"ok": False, "error": (out.stderr or out.stdout)[-400:]}
-        import json as _json
-        info = _json.loads(out.stdout.strip().splitlines()[-1])
-        info["ok"] = bool(info.get("cuda"))
-        info["see_through"] = SEE_THROUGH_DIR.exists()
-        return info
+            info = {"ok": False, "error": (out.stderr or out.stdout)[-400:]}
+        else:
+            import json as _json
+            info = _json.loads(out.stdout.strip().splitlines()[-1])
+            info["ok"] = info.get("device") not in (None, "cpu")
+            if info["device"] == "cpu":
+                info["error"] = (
+                    "no GPU found (CUDA or Apple MPS). Decomposition would take "
+                    "hours on CPU; import a PSD or build a demo project instead."
+                )
     except Exception as exc:                              # noqa: BLE001
-        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        info = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    info["see_through"] = SEE_THROUGH_DIR.exists()
+    _ENV_CACHE = info
+    return info
 
 
 if __name__ == "__main__":
